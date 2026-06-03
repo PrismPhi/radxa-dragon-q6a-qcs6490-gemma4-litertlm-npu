@@ -1,0 +1,2197 @@
+diff --git a/runtime/executor/llm_litert_npu_compiled_model_executor.cc b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+index c83e7464..20dd8548 100644
+--- a/runtime/executor/llm_litert_npu_compiled_model_executor.cc
++++ b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+@@ -17,6 +17,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <memory>
+@@ -74,7 +75,9 @@ using ::litert::Model;
+ using ::litert::TensorBuffer;
+
+ constexpr char kPrefillSignature[] = "prefill_128";
++constexpr char kPrefill1024Signature[] = "prefill_1024";
+ constexpr int kPrefillSize = 128;
++constexpr int kPrefill1024Size = 1024;
+ constexpr char kDecodeSignature[] = "decode";
+ constexpr char cache_k25[] = "kv_cache_k_25";
+ constexpr char cache_v25[] = "kv_cache_v_25";
+@@ -91,6 +94,37 @@ constexpr absl::string_view kv_cache_v_root_name = "kv_cache_v_";
+ constexpr bool kEnableDecodingDebugLogging = false;
+ #define NPU_EXECUTOR_LOG(X) ABSL_LOG_IF(X, kEnableDecodingDebugLogging)
+
++constexpr int kGemma4Ctx1024UnsafeTokenFloor = 240000;
++
++bool Q6AEnvFlagEnabled(const char* name) {
++  const char* value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') {
++    return false;
++  }
++  return std::string(value) != "0" && std::string(value) != "false" &&
++         std::string(value) != "FALSE";
++}
++
++bool Q6AHybridQuietMode() {
++  return Q6AEnvFlagEnabled("Q6A_HYBRID_QUIET");
++}
++
++int Q6AEnvIntOrDefault(const char* name, int default_value) {
++  const char* value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') {
++    return default_value;
++  }
++  char* end = nullptr;
++  const long parsed = std::strtol(value, &end, 10);
++  if (end == value || parsed <= 0 ||
++      parsed > static_cast<long>(std::numeric_limits<int>::max())) {
++    ABSL_LOG(ERROR) << "Q6A_FINAL_VALID_VOCAB_SIZE_OVERRIDE_IGNORED name="
++                    << name << " value=" << value;
++    return default_value;
++  }
++  return static_cast<int>(parsed);
++}
++
+ // Signature names for the embedder.
+ struct EmbedderSignatures {
+   static constexpr absl::string_view kPrefillEmbedder = "prefill_embedder_128";
+@@ -164,6 +198,300 @@ struct CacheUpdateSignatures {
+   static constexpr absl::string_view kInputPos = "input_pos";
+ };
+
++
++template <typename Names>
++bool ContainsSignatureName(const Names& names, absl::string_view target) {
++  for (auto name : names) {
++    if (name == target) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool IsGemma4DirectCandidate(const litert::Model* transformer_model) {
++  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++  if (!decode_signature) {
++    return false;
++  }
++
++  const auto input_names = decode_signature->InputNames();
++  const auto output_names = decode_signature->OutputNames();
++
++  return ContainsSignatureName(input_names, "param_tensor") ||
++         ContainsSignatureName(output_names, "kv_cache_k_0") ||
++         ContainsSignatureName(output_names, "kv_cache_v_0");
++}
++
++bool HasGemma4ProductionDirectContract(const litert::Model* transformer_model) {
++  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++  return decode_signature &&
++         ContainsSignatureName(decode_signature->InputNames(), "param_tensor");
++}
++
++bool IsGemma4ExportHfDirectCandidate(const litert::Model* transformer_model) {
++  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++  if (!decode_signature) {
++    return false;
++  }
++  const auto input_names = decode_signature->InputNames();
++  const auto output_names = decode_signature->OutputNames();
++  return !ContainsSignatureName(input_names, "param_tensor") &&
++         ContainsSignatureName(input_names, "mask") &&
++         ContainsSignatureName(output_names, "kv_cache_k_0") &&
++         ContainsSignatureName(output_names, "kv_cache_v_0");
++}
++
++absl::StatusOr<uint32_t> Q6AGetDirectContextCapacity(
++    const litert::Model* transformer_model) {
++  auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++  if (!decode_signature ||
++      !ContainsSignatureName(decode_signature->InputNames(), "mask")) {
++    return absl::FailedPreconditionError(
++        "Gemma4 Direct requires decode mask to determine context capacity.");
++  }
++  LITERT_ASSIGN_OR_RETURN(auto mask_tensor,
++                          decode_signature->InputTensor("mask"));
++  LITERT_ASSIGN_OR_RETURN(auto mask_type, mask_tensor.RankedTensorType());
++  const auto dimensions = mask_type.Layout().Dimensions();
++  if (dimensions.empty() || dimensions.back() <= 0) {
++    return absl::FailedPreconditionError(
++        "Gemma4 Direct decode mask has invalid context capacity.");
++  }
++  return static_cast<uint32_t>(dimensions.back());
++}
++
++template <typename Signature>
++absl::Status Q6ARequireInputElementType(const Signature& signature,
++                                        absl::string_view name,
++                                        ::litert::ElementType element_type) {
++  if (!ContainsSignatureName(signature.InputNames(), name)) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct missing input tensor: ", name));
++  }
++  LITERT_ASSIGN_OR_RETURN(auto tensor, signature.InputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto tensor_type, tensor.RankedTensorType());
++  if (tensor_type.ElementType() != element_type) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct input dtype mismatch: ", name));
++  }
++  return absl::OkStatus();
++}
++
++template <typename Signature>
++absl::Status Q6ARequireOutputElementType(const Signature& signature,
++                                         absl::string_view name,
++                                         ::litert::ElementType element_type) {
++  if (!ContainsSignatureName(signature.OutputNames(), name)) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct missing output tensor: ", name));
++  }
++  LITERT_ASSIGN_OR_RETURN(auto tensor, signature.OutputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto tensor_type, tensor.RankedTensorType());
++  if (tensor_type.ElementType() != element_type) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct output dtype mismatch: ", name));
++  }
++  return absl::OkStatus();
++}
++
++bool Q6ASameTensorContract(const ::litert::RankedTensorType& lhs,
++                           const ::litert::RankedTensorType& rhs) {
++  const auto lhs_dims = lhs.Layout().Dimensions();
++  const auto rhs_dims = rhs.Layout().Dimensions();
++  return lhs.ElementType() == rhs.ElementType() &&
++         lhs_dims.size() == rhs_dims.size() &&
++         std::equal(lhs_dims.begin(), lhs_dims.end(), rhs_dims.begin());
++}
++
++template <typename Signature>
++absl::Status Q6AValidateCacheInputOutputContract(const Signature& signature,
++                                                 absl::string_view name) {
++  LITERT_ASSIGN_OR_RETURN(auto input_tensor, signature.InputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto output_tensor, signature.OutputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto input_type, input_tensor.RankedTensorType());
++  LITERT_ASSIGN_OR_RETURN(auto output_type, output_tensor.RankedTensorType());
++  if (!Q6ASameTensorContract(input_type, output_type)) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct KV input/output mismatch: ", name));
++  }
++  return absl::OkStatus();
++}
++
++template <typename LeftSignature, typename RightSignature>
++absl::Status Q6AValidateMatchingInputContract(const LeftSignature& lhs,
++                                              const RightSignature& rhs,
++                                              absl::string_view name) {
++  LITERT_ASSIGN_OR_RETURN(auto lhs_tensor, lhs.InputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto rhs_tensor, rhs.InputTensor(name));
++  LITERT_ASSIGN_OR_RETURN(auto lhs_type, lhs_tensor.RankedTensorType());
++  LITERT_ASSIGN_OR_RETURN(auto rhs_type, rhs_tensor.RankedTensorType());
++  if (!Q6ASameTensorContract(lhs_type, rhs_type)) {
++    return absl::FailedPreconditionError(
++        absl::StrCat("Gemma4 Direct KV signature mismatch: ", name));
++  }
++  return absl::OkStatus();
++}
++
++class Gemma4ModelContractValidator {
++ public:
++  static absl::Status Validate(const litert::Model* transformer_model) {
++    auto prefill_signature =
++        transformer_model->FindSignature(kPrefillSignature);
++    if (!prefill_signature) {
++      return absl::FailedPreconditionError(
++          "Gemma4 Direct requires prefill_128 signature.");
++    }
++    auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++    if (!decode_signature) {
++      return absl::FailedPreconditionError(
++          "Gemma4 Direct requires decode signature.");
++    }
++
++    auto validate_direct_inputs = [](const auto& signature) -> absl::Status {
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "embeddings", ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "per_layer_embeddings", ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "input_pos", ::litert::ElementType::Int32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "mask", ::litert::ElementType::Bool));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "param_tensor", ::litert::ElementType::Int32));
++      return absl::OkStatus();
++    };
++    RETURN_IF_ERROR(validate_direct_inputs(*prefill_signature));
++    RETURN_IF_ERROR(validate_direct_inputs(*decode_signature));
++    RETURN_IF_ERROR(Q6ARequireOutputElementType(
++        *decode_signature, "logits",
++        ::litert::ElementType::Float32));
++
++    std::set<std::string> kv_names;
++    int key_cache_count = 0;
++    int value_cache_count = 0;
++    for (auto name : decode_signature->InputNames()) {
++      if (absl::StartsWith(name, kv_cache_k_root_name)) {
++        kv_names.insert(std::string(name));
++        ++key_cache_count;
++      } else if (absl::StartsWith(name, kv_cache_v_root_name)) {
++        kv_names.insert(std::string(name));
++        ++value_cache_count;
++      }
++    }
++    if (key_cache_count == 0 || key_cache_count != value_cache_count) {
++      return absl::FailedPreconditionError(
++          "Gemma4 Direct requires balanced kv_cache_k_* / kv_cache_v_* inputs.");
++    }
++
++    for (const std::string& name : kv_names) {
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          *prefill_signature, name, ::litert::ElementType::Int8));
++      RETURN_IF_ERROR(Q6ARequireOutputElementType(
++          *prefill_signature, name, ::litert::ElementType::Int8));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          *decode_signature, name, ::litert::ElementType::Int8));
++      RETURN_IF_ERROR(Q6ARequireOutputElementType(
++          *decode_signature, name, ::litert::ElementType::Int8));
++      RETURN_IF_ERROR(
++          Q6AValidateCacheInputOutputContract(*prefill_signature, name));
++      RETURN_IF_ERROR(
++          Q6AValidateCacheInputOutputContract(*decode_signature, name));
++      RETURN_IF_ERROR(Q6AValidateMatchingInputContract(
++          *prefill_signature, *decode_signature, name));
++    }
++    return absl::OkStatus();
++  }
++};
++
++class Gemma4ExportHfModelContractValidator {
++ public:
++  static absl::Status Validate(const litert::Model* transformer_model) {
++    auto prefill_signature =
++        transformer_model->FindSignature(kPrefillSignature);
++    if (!prefill_signature) {
++      return absl::FailedPreconditionError(
++          "Gemma4 ExportHf Direct requires prefill_128 signature.");
++    }
++    auto decode_signature = transformer_model->FindSignature(kDecodeSignature);
++    if (!decode_signature) {
++      return absl::FailedPreconditionError(
++          "Gemma4 ExportHf Direct requires decode signature.");
++    }
++
++    auto validate_direct_inputs = [](const auto& signature) -> absl::Status {
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "embeddings", ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "per_layer_embeddings", ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "input_pos", ::litert::ElementType::Int32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          signature, "mask", ::litert::ElementType::Float32));
++      if (ContainsSignatureName(signature.InputNames(), "param_tensor")) {
++        return absl::FailedPreconditionError(
++            "Gemma4 ExportHf Direct does not accept param_tensor.");
++      }
++      return absl::OkStatus();
++    };
++    RETURN_IF_ERROR(validate_direct_inputs(*prefill_signature));
++    RETURN_IF_ERROR(validate_direct_inputs(*decode_signature));
++    auto prefill_1024_signature =
++        transformer_model->FindSignature(kPrefill1024Signature);
++    if (prefill_1024_signature) {
++      RETURN_IF_ERROR(validate_direct_inputs(*prefill_1024_signature));
++    }
++    RETURN_IF_ERROR(Q6ARequireOutputElementType(
++        *decode_signature, "logits", ::litert::ElementType::Float32));
++
++    std::set<std::string> kv_names;
++    int key_cache_count = 0;
++    int value_cache_count = 0;
++    for (auto name : decode_signature->InputNames()) {
++      if (absl::StartsWith(name, kv_cache_k_root_name)) {
++        kv_names.insert(std::string(name));
++        ++key_cache_count;
++      } else if (absl::StartsWith(name, kv_cache_v_root_name)) {
++        kv_names.insert(std::string(name));
++        ++value_cache_count;
++      }
++    }
++    if (key_cache_count == 0 || key_cache_count != value_cache_count) {
++      return absl::FailedPreconditionError(
++          "Gemma4 ExportHf Direct requires balanced kv_cache_k_* / "
++          "kv_cache_v_* inputs.");
++    }
++
++    for (const std::string& name : kv_names) {
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          *prefill_signature, name, ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireOutputElementType(
++          *prefill_signature, name, ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireInputElementType(
++          *decode_signature, name, ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(Q6ARequireOutputElementType(
++          *decode_signature, name, ::litert::ElementType::Float32));
++      RETURN_IF_ERROR(
++          Q6AValidateCacheInputOutputContract(*prefill_signature, name));
++      RETURN_IF_ERROR(
++          Q6AValidateCacheInputOutputContract(*decode_signature, name));
++      RETURN_IF_ERROR(Q6AValidateMatchingInputContract(
++          *prefill_signature, *decode_signature, name));
++      if (prefill_1024_signature) {
++        RETURN_IF_ERROR(Q6ARequireInputElementType(
++            *prefill_1024_signature, name, ::litert::ElementType::Float32));
++        RETURN_IF_ERROR(Q6ARequireOutputElementType(
++            *prefill_1024_signature, name, ::litert::ElementType::Float32));
++        RETURN_IF_ERROR(
++            Q6AValidateCacheInputOutputContract(*prefill_1024_signature, name));
++        RETURN_IF_ERROR(Q6AValidateMatchingInputContract(
++            *prefill_1024_signature, *decode_signature, name));
++      }
++    }
++    return absl::OkStatus();
++  }
++};
++
+ struct MtpSignatures {
+   static constexpr absl::string_view kMtpDrafter = "mtp_drafter";
+   static constexpr absl::string_view kMtpRope = "rope";
+@@ -225,6 +553,181 @@ absl::Status SetFirstElement(::litert::TensorBuffer& buffer, int32_t value) {
+   return absl::OkStatus();
+ }
+
++
++
++
++absl::Status Q6AFillOneTokenId(::litert::TensorBuffer& buffer, int32_t id) {
++  LITERT_ASSIGN_OR_RETURN(auto packed_size, buffer.PackedSize());
++  LITERT_ASSIGN_OR_RETURN(
++      auto lock_and_addr,
++      ::litert::TensorBufferScopedLock::Create(
++          buffer, ::litert::TensorBuffer::LockMode::kWrite));
++  std::memset(lock_and_addr.second, 0, packed_size);
++  static_cast<int32_t*>(lock_and_addr.second)[0] = id;
++  return absl::OkStatus();
++}
++
++
++bool Q6AIsKvCacheBufferName(absl::string_view name) {
++  return absl::StartsWith(name, "kv_cache_k_") ||
++         absl::StartsWith(name, "kv_cache_v_");
++}
++
++absl::Status Q6ACopyTensorBuffer(::litert::TensorBuffer& src,
++                                 ::litert::TensorBuffer& dst) {
++  LITERT_ASSIGN_OR_RETURN(auto src_size, src.PackedSize());
++  LITERT_ASSIGN_OR_RETURN(auto dst_size, dst.PackedSize());
++  if (src_size != dst_size) {
++    return absl::InvalidArgumentError(absl::StrCat(
++        "Q6ACopyTensorBuffer: size mismatch src=", src_size,
++        " dst=", dst_size));
++  }
++
++  LITERT_ASSIGN_OR_RETURN(
++      auto src_lock,
++      ::litert::TensorBufferScopedLock::Create(
++          src, ::litert::TensorBuffer::LockMode::kRead));
++  LITERT_ASSIGN_OR_RETURN(
++      auto dst_lock,
++      ::litert::TensorBufferScopedLock::Create(
++          dst, ::litert::TensorBuffer::LockMode::kWrite));
++
++  std::memcpy(dst_lock.second, src_lock.second, src_size);
++  return absl::OkStatus();
++}
++
++class Gemma4KvCacheBinder {
++ public:
++  static absl::Status BindNextState(
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>& outputs,
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
++          prefill_inputs,
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
++          decode_inputs,
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>*
++          next_prefill_inputs = nullptr,
++      bool emit_marker = true) {
++    int copied = 0;
++    for (auto& [name, output_buffer] : outputs) {
++      if (!Q6AIsKvCacheBufferName(name)) {
++        continue;
++      }
++      RETURN_IF_ERROR(CopyToInput(output_buffer, prefill_inputs, name));
++      if (next_prefill_inputs != nullptr &&
++          next_prefill_inputs != &prefill_inputs) {
++        RETURN_IF_ERROR(CopyToInput(output_buffer, *next_prefill_inputs, name));
++      }
++      RETURN_IF_ERROR(CopyToInput(output_buffer, decode_inputs, name));
++      ++copied;
++    }
++
++    if (copied == 0) {
++      return absl::FailedPreconditionError(
++          "Gemma4KvCacheBinder: no kv_cache_* buffers copied");
++    }
++
++    if (emit_marker) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_KV_BIND_OK buffers=" << copied;
++    }
++    return absl::OkStatus();
++  }
++
++  static absl::Status BindDecodeState(
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>& outputs,
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>&
++          decode_inputs) {
++    int copied = 0;
++    for (auto& [name, output_buffer] : outputs) {
++      if (!Q6AIsKvCacheBufferName(name)) {
++        continue;
++      }
++      RETURN_IF_ERROR(CopyToInput(output_buffer, decode_inputs, name));
++      ++copied;
++    }
++    if (copied == 0) {
++      return absl::FailedPreconditionError(
++          "Gemma4KvCacheBinder: no decode kv_cache_* buffers copied");
++    }
++    return absl::OkStatus();
++  }
++
++ private:
++  static absl::Status CopyToInput(
++      ::litert::TensorBuffer& output_buffer,
++      absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>& inputs,
++      absl::string_view name) {
++    if (!inputs.contains(name)) {
++      return absl::FailedPreconditionError(
++          absl::StrCat("Gemma4KvCacheBinder: input KV buffer missing: ", name));
++    }
++    return Q6ACopyTensorBuffer(output_buffer, inputs[name]);
++  }
++};
++
++absl::Status Q6ACopyOneTokenBufferToPrefillSlot(
++    ::litert::TensorBuffer& src_one_token_buffer,
++    ::litert::TensorBuffer& dst_prefill_buffer, int slot_index) {
++  LITERT_ASSIGN_OR_RETURN(auto src_size, src_one_token_buffer.PackedSize());
++  LITERT_ASSIGN_OR_RETURN(auto dst_size, dst_prefill_buffer.PackedSize());
++
++  if ((slot_index + 1) * src_size > dst_size) {
++    return absl::InvalidArgumentError(
++        "Q6ACopyOneTokenBufferToPrefillSlot: slot out of range.");
++  }
++
++  LITERT_ASSIGN_OR_RETURN(
++      auto src_lock,
++      ::litert::TensorBufferScopedLock::Create(
++          src_one_token_buffer, ::litert::TensorBuffer::LockMode::kRead));
++  LITERT_ASSIGN_OR_RETURN(
++      auto dst_lock,
++      ::litert::TensorBufferScopedLock::Create(
++          dst_prefill_buffer, ::litert::TensorBuffer::LockMode::kWrite));
++
++  auto* dst = static_cast<char*>(dst_lock.second);
++  std::memcpy(dst + slot_index * src_size, src_lock.second, src_size);
++  return absl::OkStatus();
++}
++
++absl::Status Q6AFillTokenIds(::litert::TensorBuffer& buffer,
++                             absl::Span<const int> ids) {
++  LITERT_ASSIGN_OR_RETURN(auto packed_size, buffer.PackedSize());
++  LITERT_ASSIGN_OR_RETURN(
++      auto lock_and_addr,
++      ::litert::TensorBufferScopedLock::Create(
++          buffer, ::litert::TensorBuffer::LockMode::kWrite));
++  std::memset(lock_and_addr.second, 0, packed_size);
++  auto* ptr = static_cast<int32_t*>(lock_and_addr.second);
++  const size_t n = std::min(ids.size(), packed_size / sizeof(int32_t));
++  for (size_t i = 0; i < n; ++i) {
++    ptr[i] = ids[i];
++  }
++  return absl::OkStatus();
++}
++
++absl::Status Q6AFillInputPositions(::litert::TensorBuffer& buffer,
++                                   int32_t start, int32_t steps) {
++  LITERT_ASSIGN_OR_RETURN(auto tensor_type, buffer.TensorType());
++  if (tensor_type.ElementType() != ::litert::ElementType::Int32) {
++    return absl::InvalidArgumentError("Q6AFillInputPositions expects Int32.");
++  }
++  LITERT_ASSIGN_OR_RETURN(auto packed_size, buffer.PackedSize());
++  LITERT_ASSIGN_OR_RETURN(size_t num_elements,
++                          tensor_type.Layout().NumElements());
++  LITERT_ASSIGN_OR_RETURN(
++      auto lock_and_addr,
++      ::litert::TensorBufferScopedLock::Create(
++          buffer, ::litert::TensorBuffer::LockMode::kWrite));
++  std::memset(lock_and_addr.second, 0, packed_size);
++  auto* ptr = static_cast<int32_t*>(lock_and_addr.second);
++  const int64_t n =
++      std::min<int64_t>(steps, static_cast<int64_t>(num_elements));
++  for (int64_t i = 0; i < n; ++i) {
++    ptr[i] = start + i;
++  }
++  return absl::OkStatus();
++}
++
+ template <typename T>
+ absl::StatusOr<int> FindMaxIndex(const TensorBuffer& decoded_logits) {
+   LITERT_ASSIGN_OR_RETURN(auto logits_buffer,
+@@ -242,6 +745,44 @@ absl::StatusOr<int> FindMaxIndex(const TensorBuffer& decoded_logits) {
+   }
+   return max_index;
+ }
++
++template <typename T>
++absl::StatusOr<int> FindMaxIndexWithinVocab(const TensorBuffer& decoded_logits,
++                                            int valid_vocab_size) {
++  LITERT_ASSIGN_OR_RETURN(auto logits_buffer,
++                          CopyFromTensorBuffer<T>(decoded_logits));
++  if (logits_buffer.empty()) {
++    return absl::InvalidArgumentError("Logits buffer is empty.");
++  }
++  const int limit =
++      std::min<int>(valid_vocab_size, static_cast<int>(logits_buffer.size()));
++  if (limit <= 0) {
++    return absl::InvalidArgumentError(
++        absl::StrCat("No valid logits candidates. valid_vocab_size=",
++                     valid_vocab_size, " logits_size=", logits_buffer.size()));
++  }
++  int max_index = 0;
++  T max_value = std::numeric_limits<T>::lowest();
++  for (int i = 0; i < limit; ++i) {
++    if (logits_buffer[i] > max_value) {
++      max_value = logits_buffer[i];
++      max_index = i;
++    }
++  }
++  return max_index;
++}
++
++absl::StatusOr<int> GetLogitsElementCount(const TensorBuffer& decoded_logits) {
++  LITERT_ASSIGN_OR_RETURN(RankedTensorType logits_tensor_type,
++                          decoded_logits.TensorType());
++  LITERT_ASSIGN_OR_RETURN(size_t num_elements,
++                          logits_tensor_type.Layout().NumElements());
++  if (num_elements > static_cast<size_t>(std::numeric_limits<int>::max())) {
++    return absl::InvalidArgumentError(
++        absl::StrCat("Logits tensor is too large: ", num_elements));
++  }
++  return static_cast<int>(num_elements);
++}
+ // Copies the raw bytes from the tensor buffer.
+ absl::StatusOr<std::vector<uint8_t>> CopyRawBytesFromTensorBuffer(
+     const TensorBuffer& buffer) {
+@@ -288,6 +829,79 @@ absl::StatusOr<int> ApplyGreedySampling(const TensorBuffer& decoded_logits) {
+   }
+ }
+
++absl::StatusOr<int> ApplyGreedySamplingWithinValidVocab(
++    const TensorBuffer& decoded_logits, int valid_vocab_size) {
++  LITERT_ASSIGN_OR_RETURN(RankedTensorType logits_tensor_type,
++                          decoded_logits.TensorType());
++  if (logits_tensor_type.ElementType() == ::litert::ElementType::Float32) {
++    return FindMaxIndexWithinVocab<float>(decoded_logits, valid_vocab_size);
++  } else if (logits_tensor_type.ElementType() == ::litert::ElementType::Int16) {
++    return FindMaxIndexWithinVocab<int16_t>(decoded_logits, valid_vocab_size);
++  } else if (logits_tensor_type.ElementType() == ::litert::ElementType::Int8) {
++    return FindMaxIndexWithinVocab<int8_t>(decoded_logits, valid_vocab_size);
++  } else {
++    return absl::InvalidArgumentError(absl::StrCat(
++        "Unsupported tensor element type for valid-vocab greedy sampling: ",
++        logits_tensor_type.ElementType()));
++  }
++}
++
++absl::StatusOr<int> Q6AResampleCtx1024UnsafeSampledToken(
++    const TensorBuffer& decoded_logits, int sampled_id, uint32_t max_num_tokens) {
++  LITERT_ASSIGN_OR_RETURN(int logits_element_count,
++                          GetLogitsElementCount(decoded_logits));
++  const int valid_vocab_size = std::min(
++      logits_element_count,
++      Q6AEnvIntOrDefault("Q6A_GEMMA4_VALID_VOCAB_SIZE",
++                         kGemma4Ctx1024UnsafeTokenFloor));
++  const bool sample_trace = Q6AEnvFlagEnabled("Q6A_FINAL_SAMPLE_TRACE");
++  if (sample_trace) {
++    ABSL_LOG(ERROR) << "Q6A_FINAL_SAMPLE_ID_RAW sampled_id=" << sampled_id;
++    ABSL_LOG(ERROR) << "Q6A_FINAL_VALID_VOCAB_SIZE valid_vocab_size="
++                    << valid_vocab_size
++                    << " logits_elements=" << logits_element_count;
++  }
++  if (!Q6AEnvFlagEnabled("Q6A_GEMMA4_CTX1024_UNSAFE_TOKEN_GUARD") ||
++      max_num_tokens > kPrefill1024Size) {
++    if (sample_trace) {
++      ABSL_LOG(ERROR)
++          << "Q6A_FINAL_STOP_REASON token_policy_disabled_or_ctx4096";
++    }
++    return sampled_id;
++  }
++  if (sampled_id >= 0 && sampled_id < valid_vocab_size) {
++    if (sample_trace) {
++      ABSL_LOG(ERROR) << "Q6A_FINAL_STOP_REASON sampled_token_valid";
++    }
++    return sampled_id;
++  }
++
++  ABSL_LOG(ERROR) << "Q6A_FINAL_SAMPLE_ID_RAW sampled_id=" << sampled_id;
++  ABSL_LOG(ERROR) << "Q6A_FINAL_VALID_VOCAB_SIZE valid_vocab_size="
++                  << valid_vocab_size
++                  << " logits_elements=" << logits_element_count;
++  ABSL_LOG(ERROR) << "Q6A_FINAL_SAMPLE_ID_INVALID sampled_id=" << sampled_id
++                  << " valid_vocab_size=" << valid_vocab_size
++                  << " max_tokens=" << max_num_tokens;
++  ABSL_LOG(ERROR) << "Q6A_GEMMA4_CTX1024_UNSAFE_TOKEN_GUARD sampled_id="
++                  << sampled_id << " policy=resample max_tokens="
++                  << max_num_tokens;
++  ABSL_LOG(ERROR) << "Q6A_FINAL_UNSAFE_TOKEN_POLICY=resample";
++  LITERT_ASSIGN_OR_RETURN(
++      int resampled_id,
++      ApplyGreedySamplingWithinValidVocab(decoded_logits, valid_vocab_size));
++  if (resampled_id < 0 || resampled_id >= valid_vocab_size) {
++    ABSL_LOG(ERROR) << "Q6A_FINAL_STOP_REASON no_valid_resample_candidate";
++    return absl::InternalError(absl::StrCat(
++        "Resampled token is still invalid: ", resampled_id,
++        " valid_vocab_size=", valid_vocab_size));
++  }
++  ABSL_LOG(ERROR) << "Q6A_FINAL_SAMPLE_RESAMPLED before=" << sampled_id
++                  << " after=" << resampled_id;
++  ABSL_LOG(ERROR) << "Q6A_FINAL_STOP_REASON resampled_valid_token";
++  return resampled_id;
++}
++
+ // Returns true if the transformer model has a per layer embedder input buffer.
+ litert::Expected<bool> HasPerLayerEmbedder(
+     const litert::Model& transformer_model) {
+@@ -894,7 +1508,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
+   // Create output buffers for prefill signature.
+   for (auto output_name : prefill_signature->OutputNames()) {
+     if (absl::StartsWith(output_name, kv_cache_slice_k_root_name) ||
+-        absl::StartsWith(output_name, kv_cache_slice_v_root_name)) {
++        absl::StartsWith(output_name, kv_cache_slice_v_root_name) ||
++        absl::StartsWith(output_name, kv_cache_k_root_name) ||
++        absl::StartsWith(output_name, kv_cache_v_root_name)) {
+       LITERT_ASSIGN_OR_RETURN(
+           prefill_output_kv_cache_slice_buffers[output_name],
+           llm_compiled_model.CreateOutputBuffer(kPrefillSignature,
+@@ -904,7 +1520,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
+   // Create output buffers for decode signature.
+   for (auto output_name : decode_signature->OutputNames()) {
+     if (absl::StartsWith(output_name, kv_cache_slice_k_root_name) ||
+-        absl::StartsWith(output_name, kv_cache_slice_v_root_name)) {
++        absl::StartsWith(output_name, kv_cache_slice_v_root_name) ||
++        absl::StartsWith(output_name, kv_cache_k_root_name) ||
++        absl::StartsWith(output_name, kv_cache_v_root_name)) {
+       LITERT_ASSIGN_OR_RETURN(
+           decode_output_kv_cache_slice_buffers[output_name],
+           llm_compiled_model.CreateOutputBuffer(kDecodeSignature, output_name));
+@@ -925,7 +1543,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
+     }
+     for (auto output_name : verify_signature->OutputNames()) {
+       if (absl::StartsWith(output_name, kv_cache_slice_k_root_name) ||
+-          absl::StartsWith(output_name, kv_cache_slice_v_root_name)) {
++          absl::StartsWith(output_name, kv_cache_slice_v_root_name) ||
++          absl::StartsWith(output_name, kv_cache_k_root_name) ||
++          absl::StartsWith(output_name, kv_cache_v_root_name)) {
+         LITERT_ASSIGN_OR_RETURN(
+             verify_output_kv_cache_slice_buffers[output_name],
+             llm_compiled_model.CreateOutputBuffer(LlmSignatures::kVerifyLlm,
+@@ -1196,9 +1816,24 @@ LlmLiteRtNpuCompiledModelExecutor::
+     // Reuse kv cache buffers from main model
+     if (absl::StartsWith(input_name, kv_cache_k_root_name) ||
+         absl::StartsWith(input_name, kv_cache_v_root_name)) {
+-      LITERT_ASSIGN_OR_RETURN(
+-          mtp_input_buffers[input_name],
+-          drafter_input_kv_cache_buffers[input_name].Duplicate());
++      if (Q6AEnvFlagEnabled("Q6A_OFFICIAL_MTP_NPU_HYBRID")) {
++        // Gemma4 Direct uses NPU KV buffers for the main graph, while the MTP
++        // drafter runs on CPU. Duplicating the NPU-side buffer here can produce
++        // a non-host-writable drafter input; use a fresh CPU input buffer and
++        // copy the current KV state into it before each drafter run.
++        LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[input_name],
++                                mtp_compiled_model.CreateInputBuffer(
++                                    MtpSignatures::kMtpDrafter, input_name));
++        mtp_input_buffers[input_name].Clear();
++        if (!Q6AHybridQuietMode()) {
++          ABSL_LOG(ERROR) << "Q6A_HYBRID_DRAFTER_KV_HOST_BUFFER name="
++                          << input_name;
++        }
++      } else {
++        LITERT_ASSIGN_OR_RETURN(
++            mtp_input_buffers[input_name],
++            drafter_input_kv_cache_buffers[input_name].Duplicate());
++      }
+     } else {
+       LITERT_ASSIGN_OR_RETURN(mtp_input_buffers[input_name],
+                               mtp_compiled_model.CreateInputBuffer(
+@@ -1480,18 +2115,64 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
+   LITERT_ASSIGN_OR_RETURN(auto ids,
+                           ReferTensorBufferAsSpan<int32_t>(*text_token_ids));
+
++  if (UsesGemma4DirectPlan()) {
++    if (current_step_ != 0) {
++      return absl::UnimplementedError(
++          "Q6A_GEMMA4_MULTI_TURN_PREFILL_UNSUPPORTED: Direct plan currently "
++          "supports only the initial short-context prefill.");
++    }
++    if (ids.size() > kPrefillSize &&
++        (!UsesGemma4ExportHfDirectPlan() ||
++         !direct_prefill_1024_inference_context_.has_value())) {
++      return absl::UnimplementedError(
++          "Q6A_GEMMA4_PREFILL1024_UNSUPPORTED: Direct plan currently supports "
++          "only prefill_128.");
++    }
++    if (ids.size() > executor_settings_.GetMaxNumTokens()) {
++      return absl::ResourceExhaustedError(absl::StrCat(
++          "Q6A_GEMMA4_CONTEXT_EXHAUSTED_PREFILL tokens=", ids.size(),
++          " max_tokens=", executor_settings_.GetMaxNumTokens()));
++    }
++    if (ids.size() > kPrefill1024Size) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_MULTI_CHUNK_PREFILL_START tokens="
++                      << ids.size();
++    }
++  }
++
++  std::vector<int> direct_prompt_tokens;
++  if (UsesGemma4DirectPlan()) {
++    direct_prompt_tokens.assign(ids.begin(), ids.end());
++  }
+   LITERT_ASSIGN_OR_RETURN(
+       auto work_groups,
+       GetOptimizedPrefillWorkGroups(prefill_signature_map_, ids.size()));
+-  for (const auto& [prefill_signature, prefill_length] : work_groups) {
++  for (size_t group = 0; group < work_groups.size(); ++group) {
++    const auto& [prefill_signature, prefill_length] = work_groups[group];
+     RETURN_IF_ERROR(PrefillInternal(prefill_signature,
+-                                    ids.subspan(/*pos=*/0, prefill_length)));
++                                    ids.subspan(/*pos=*/0, prefill_length),
++                                    group + 1 < work_groups.size()));
+     ids = ids.subspan(/*pos=*/prefill_length);
+     latency_stats_.prefill_num_tokens += prefill_length;
+   }
+   RET_CHECK_EQ(ids.size(), 0).SetCode(absl::StatusCode::kInternal)
+       << "Work groups not covering the entire prefill input.";
+
++  if (UsesGemma4DirectPlan()) {
++    if (direct_prompt_tokens.size() > 1) {
++      processed_tokens_.AddProcessedTokens(std::vector<int>(
++          direct_prompt_tokens.begin(), direct_prompt_tokens.end() - 1));
++    }
++    if (!direct_prompt_tokens.empty()) {
++      RETURN_IF_ERROR(processed_tokens_.AddPendingInputToken(
++          {std::make_shared<TokenData>(direct_prompt_tokens.back())}));
++    }
++    if (direct_prompt_tokens.size() > kPrefill1024Size) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_MULTI_CHUNK_PREFILL_DONE chunks="
++                      << work_groups.size() << " tokens="
++                      << direct_prompt_tokens.size();
++    }
++  }
++
+   if (UseEmbeddingLookupManager()) {
+     RETURN_IF_ERROR(embedding_lookup_manager_->CleanupMultiModalEmbeddings());
+   }
+@@ -1600,6 +2281,11 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+   }
+
+   if (speculative_decoding_type_ == SpeculativeDecodingType::kMTP) {
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_START step=" << mtp_start_step
++                      << " token=" << mtp_start_token_id;
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_LOOP_START step=" << mtp_start_step;
++    }
+     NPU_EXECUTOR_LOG(INFO) << "Step " << mtp_start_step
+                            << ": Starting MTP Speculative Cycle";
+     NPU_EXECUTOR_LOG(INFO) << "    [Verify] Step -1 at pos "
+@@ -1608,9 +2294,17 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+
+     LITERT_ASSIGN_OR_RETURN(std::vector<int> draft_tokens,
+                             RunDrafterLoop(mtp_start_step, mtp_start_token_id));
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_DRAFT_READY count="
++                      << draft_tokens.size() << " tokens=["
++                      << absl::StrJoin(draft_tokens, ",") << "]";
++    }
+     auto start_verify = absl::Now();
+     RETURN_IF_ERROR(
+         RunVerifierBatch(mtp_start_step, mtp_start_token_id, draft_tokens));
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_VERIFY_INVOKE_OK";
++    }
+     latency_stats_.decode_llm_inference_latency_us +=
+         absl::ToInt64Microseconds(absl::Now() - start_verify);
+
+@@ -1624,9 +2318,32 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+     NPU_EXECUTOR_LOG(INFO) << "  MTP Accepted " << rs_result.num_accepted
+                            << " draft tokens. Bonus: "
+                            << rs_result.bonus_token_id;
++    if (UsesGemma4DirectPlan()) {
++      if (!Q6AHybridQuietMode()) {
++        ABSL_LOG(ERROR) << "Q6A_HYBRID_ACCEPT_COUNT accepted="
++                        << rs_result.num_accepted
++                        << " draft_count=" << draft_tokens.size()
++                        << " bonus=" << rs_result.bonus_token_id;
++        ABSL_LOG(ERROR) << "Q6A_HYBRID_ACCEPTED_TOKENS accepted="
++                        << rs_result.num_accepted
++                        << " draft_count=" << draft_tokens.size();
++      }
++      const double tokens_per_verify =
++          draft_tokens.empty()
++              ? 0.0
++              : static_cast<double>(rs_result.num_accepted + 1) /
++                    static_cast<double>(1);
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_TOKENS_PER_VERIFY value="
++                      << tokens_per_verify;
++    }
+
+     auto start_commit = absl::Now();
+     RETURN_IF_ERROR(CommitVerifiedKVCache(mtp_start_step));
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_TOKEN_STATE_ADVANCED start_step="
++                      << mtp_start_step
++                      << " returned_or_queued=" << (rs_result.num_accepted + 1);
++    }
+     latency_stats_.decode_cache_update_inference_latency_us +=
+         absl::ToInt64Microseconds(absl::Now() - start_commit);
+
+@@ -1687,6 +2404,13 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+     latency_stats_.decode_num_tokens++;
+     latency_stats_.decode_e2e_latency_us +=
+         absl::ToInt64Microseconds(absl::Now() - start);
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_DONE first_token="
++                      << first_token_id
++                      << " queued=" << pending_accepted_tokens_.size();
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_LOOP_DONE emitted_first_token="
++                      << first_token_id;
++    }
+     return std::vector<std::vector<int>>{{first_token_id}};
+
+   } else {
+@@ -1695,8 +2419,13 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+         llm_inference_context_
+             .decode_output_buffers[LlmSignatures::kDecodeLogitsOutput];
+     auto start_sample = absl::Now();
+-    LITERT_ASSIGN_OR_RETURN(const int max_index,
+-                            ApplyGreedySampling(decoded_logits));
++    LITERT_ASSIGN_OR_RETURN(int max_index, ApplyGreedySampling(decoded_logits));
++    if (UsesGemma4DirectPlan()) {
++      LITERT_ASSIGN_OR_RETURN(
++          max_index, Q6AResampleCtx1024UnsafeSampledToken(
++                         decoded_logits, max_index,
++                         executor_settings_.GetMaxNumTokens()));
++    }
+     latency_stats_.decode_sampling_latency_us +=
+         absl::ToInt64Microseconds(absl::Now() - start_sample);
+
+@@ -1721,6 +2450,11 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+     latency_stats_.decode_e2e_latency_us +=
+         absl::ToInt64Microseconds(absl::Now() - start);
+     latency_stats_.decode_num_tokens++;
++    if (UsesGemma4DirectPlan() &&
++        !q6a_direct_generation_marker_emitted_) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_GENERATION_DONE sampled_id=" << max_index;
++      q6a_direct_generation_marker_emitted_ = true;
++    }
+     return std::vector<std::vector<int>>{{max_index}};
+   }
+ }
+@@ -1728,19 +2462,155 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
+ // Prefill internal implementation, for one prefill call to the compiled model
+ // with a certain length.
+ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+-    absl::string_view prefill_signature, absl::Span<const int> ids) {
++    absl::string_view prefill_signature, absl::Span<const int> ids,
++    bool has_following_prefill) {
++  if (UsesGemma4DirectPlan()) {
++    const bool use_prefill_1024 = prefill_signature == kPrefill1024Signature;
++    const int prefill_capacity =
++        use_prefill_1024 ? kPrefill1024Size : kPrefillSize;
++    if ((prefill_signature != LlmSignatures::kPrefillLlm &&
++         !use_prefill_1024) ||
++        (use_prefill_1024 &&
++         (!UsesGemma4ExportHfDirectPlan() ||
++          !direct_prefill_1024_inference_context_.has_value())) ||
++        ids.size() > prefill_capacity) {
++      return absl::UnimplementedError(
++          "Q6A_GEMMA4_PREFILL_SIGNATURE_UNSUPPORTED: Direct plan received an "
++          "unavailable prefill signature.");
++    }
++    if (use_prefill_1024) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_PREFILL1024_START tokens=" << ids.size();
++    } else {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_PREFILL128_START tokens=" << ids.size();
++    }
++    if (!embedder_context_.has_value()) {
++      return absl::InternalError("Q6A_GEMMA4_DIRECT_NO_EMBEDDER_CONTEXT");
++    }
++    if (!embedder_per_layer_context_.has_value()) {
++      return absl::InternalError(
++          "Q6A_GEMMA4_DIRECT_NO_PER_LAYER_EMBEDDER_CONTEXT");
++    }
++
++    auto& prefill_context =
++        use_prefill_1024 ? *direct_prefill_1024_inference_context_
++                         : llm_inference_context_;
++    auto& llm_inputs = prefill_context.prefill_input_buffers;
++    const int num_tokens = std::min<int>(ids.size(), prefill_capacity);
++    if (current_step_ < 0 ||
++        static_cast<uint64_t>(current_step_) +
++                static_cast<uint64_t>(num_tokens) >
++            executor_settings_.GetMaxNumTokens()) {
++      return absl::ResourceExhaustedError(absl::StrCat(
++          "Q6A_GEMMA4_CONTEXT_EXHAUSTED_PREFILL current_step=",
++          current_step_, " tokens=", num_tokens, " max_tokens=",
++          executor_settings_.GetMaxNumTokens()));
++    }
++
++    if (llm_inputs.contains(LlmSignatures::kInputEmbeddings)) {
++      llm_inputs[LlmSignatures::kInputEmbeddings].Clear();
++    }
++    if (llm_inputs.contains(kPerLayerEmbedderTensor)) {
++      llm_inputs[kPerLayerEmbedderTensor].Clear();
++    }
++
++    for (int i = 0; i < num_tokens; ++i) {
++      RETURN_IF_ERROR(Q6AFillOneTokenId(
++          embedder_context_->inference_context
++              .prefill_input_buffers[EmbedderSignatures::kEmbedderInput],
++          ids[i]));
++
++      auto embedder_res = embedder_context_->embedder_compiled_model.Run(
++          "embedder",
++          embedder_context_->inference_context.prefill_input_buffers,
++          embedder_context_->inference_context.prefill_output_buffers);
++      RET_CHECK(embedder_res)
++          << "Q6A_GEMMA4_DIRECT_PREFILL_EMBEDDER_FAILED: "
++          << embedder_res.Error().Message();
++
++      RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++          embedder_context_->inference_context
++              .prefill_output_buffers[EmbedderSignatures::kEmbedderOutput],
++          llm_inputs[LlmSignatures::kInputEmbeddings], i));
++
++      RETURN_IF_ERROR(Q6AFillOneTokenId(
++          embedder_per_layer_context_->inference_context
++              .prefill_input_buffers
++                  [EmbedderPerLayerSignatures::kEmbedderInput],
++          ids[i]));
++
++      auto per_layer_res =
++          embedder_per_layer_context_->embedder_per_layer_compiled_model.Run(
++              "per_layer_embedder",
++              embedder_per_layer_context_->inference_context
++                  .prefill_input_buffers,
++              embedder_per_layer_context_->inference_context
++                  .prefill_output_buffers);
++      RET_CHECK(per_layer_res)
++          << "Q6A_GEMMA4_DIRECT_PREFILL_PER_LAYER_EMBEDDER_FAILED: "
++          << per_layer_res.Error().Message();
++
++      RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++          embedder_per_layer_context_->inference_context.prefill_output_buffers
++              [EmbedderPerLayerSignatures::kEmbedderOutput],
++          llm_inputs[kPerLayerEmbedderTensor], i));
++    }
++
++    if (llm_inputs.contains("input_pos")) {
++      RETURN_IF_ERROR(Q6AFillInputPositions(llm_inputs["input_pos"],
++                                            current_step_, prefill_capacity));
++    }
++    if (llm_inputs.contains("mask")) {
++      RETURN_IF_ERROR(InitializeAttentionMask(llm_inputs["mask"],
++                                              /*is_f16=*/false));
++      RETURN_IF_ERROR(FillAttentionMask(llm_inputs["mask"], current_step_,
++                                        num_tokens));
++    }
++    if (llm_inputs.contains("param_tensor")) {
++      RETURN_IF_ERROR(FillSingleBufferCacheParamTensor(
++          llm_inputs["param_tensor"], current_step_, num_tokens));
++    }
++
++    auto res = llm_compiled_model_.Run(
++        prefill_signature, prefill_context.prefill_input_buffers,
++        prefill_context.prefill_output_buffers);
++    RET_CHECK(res) << "Q6A_GEMMA4_DIRECT_PREFILL_RUNTIME_FAILED: "
++                   << res.Error().Message();
++
++    absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer>*
++        next_prefill_inputs = nullptr;
++    if (has_following_prefill && direct_prefill_1024_inference_context_) {
++      next_prefill_inputs =
++          use_prefill_1024
++              ? &llm_inference_context_.prefill_input_buffers
++              : &direct_prefill_1024_inference_context_->prefill_input_buffers;
++    }
++    RETURN_IF_ERROR(Gemma4KvCacheBinder::BindNextState(
++        prefill_context.prefill_output_buffers,
++        prefill_context.prefill_input_buffers,
++        llm_inference_context_.decode_input_buffers, next_prefill_inputs));
++
++    current_step_ += num_tokens;
++
++    if (use_prefill_1024) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_PREFILL1024_DONE tokens=" << num_tokens;
++    } else {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_PREFILL128_DONE tokens=" << num_tokens;
++    }
++    return absl::OkStatus();
++  }
++
+   auto start_prepare_inputs = absl::Now();
+   {
+     // Prefill input tokens.
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_input_size,
+-        embedder_context_.inference_context
++        embedder_context_->inference_context
+             .prefill_input_buffers[EmbedderSignatures::kEmbedderInput]
+             .Size());
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_input_lock_and_addr,
+         ::litert::TensorBufferScopedLock::Create(
+-            embedder_context_.inference_context
++            embedder_context_->inference_context
+                 .prefill_input_buffers[EmbedderSignatures::kEmbedderInput],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     auto* prefill_input_ptr =
+@@ -1749,11 +2619,11 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+     // Prefill input position.
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_input_pos_size,
+-        rope_context_.prefill_input_buffers[RopeSignatures::kInputPos].Size());
++        rope_context_->prefill_input_buffers[RopeSignatures::kInputPos].Size());
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_input_pos_lock_and_addr,
+         ::litert::TensorBufferScopedLock::Create(
+-            rope_context_.prefill_input_buffers[RopeSignatures::kInputPos],
++            rope_context_->prefill_input_buffers[RopeSignatures::kInputPos],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     auto* prefill_input_pos_ptr =
+         static_cast<int32_t*>(prefill_input_pos_lock_and_addr.second);
+@@ -1761,13 +2631,12 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+     // Timestep input.
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_timestep_size,
+-        mask_context_.prefill_input_buffers[MaskSignatures::kMaskInputTimeStep]
++        mask_context_->prefill_input_buffers[MaskSignatures::kMaskInputTimeStep]
+             .Size());
+     LITERT_ASSIGN_OR_RETURN(
+         auto prefill_timestep_lock_and_addr,
+         ::litert::TensorBufferScopedLock::Create(
+-            mask_context_
+-                .prefill_input_buffers[MaskSignatures::kMaskInputTimeStep],
++            mask_context_->prefill_input_buffers[MaskSignatures::kMaskInputTimeStep],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     auto* prefill_timestep_ptr =
+         static_cast<int32_t*>(prefill_timestep_lock_and_addr.second);
+@@ -1865,10 +2734,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+     // Invoke embedder signature for Gemma3, because we don't have the
+     // embedding lookup manager to do it for us.
+     auto start = absl::Now();
+-    auto res = embedder_context_.embedder_compiled_model.Run(
++    auto res = embedder_context_->embedder_compiled_model.Run(
+         EmbedderSignatures::kPrefillEmbedder,
+-        embedder_context_.inference_context.prefill_input_buffers,
+-        embedder_context_.inference_context.prefill_output_buffers);
++        embedder_context_->inference_context.prefill_input_buffers,
++        embedder_context_->inference_context.prefill_output_buffers);
+     RET_CHECK(res) << "Failed to run embedder model." << res.Error().Message();
+     auto end = absl::Now();
+     latency_stats_.prefill_embedder_inference_latency_us +=
+@@ -1894,9 +2763,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+   // Invoke RoPE signature.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-        RopeSignatures::kPrefillRope, rope_context_.prefill_input_buffers,
+-        rope_context_.prefill_output_buffers);
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++        RopeSignatures::kPrefillRope, rope_context_->prefill_input_buffers,
++        rope_context_->prefill_output_buffers);
+     RET_CHECK(res) << "Failed to run RoPE model." << res.Error().Message();
+     auto end = absl::Now();
+     latency_stats_.prefill_rope_inference_latency_us +=
+@@ -1906,9 +2775,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+   // Invoke mask signature.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-        MaskSignatures::kPrefillMask, mask_context_.prefill_input_buffers,
+-        mask_context_.prefill_output_buffers);
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++        MaskSignatures::kPrefillMask, mask_context_->prefill_input_buffers,
++        mask_context_->prefill_output_buffers);
+     RET_CHECK(res) << "Failed to run compiled model." << res.Error().Message();
+     auto end = absl::Now();
+     latency_stats_.prefill_mask_inference_latency_us +=
+@@ -1931,10 +2800,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+   // Cache update.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
+         CacheUpdateSignatures::kPrefillCacheUpdate,
+-        cache_update_inference_context_.prefill_input_buffers,
+-        cache_update_inference_context_.prefill_output_buffers);
++        cache_update_inference_context_->prefill_input_buffers,
++        cache_update_inference_context_->prefill_output_buffers);
+     auto end = absl::Now();
+     latency_stats_.prefill_cache_update_inference_latency_us +=
+         absl::ToInt64Microseconds(end - start);
+@@ -1946,6 +2815,111 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::PrefillInternal(
+
+ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+     int step, std::shared_ptr<TokenData> token) {
++  if (UsesGemma4DirectPlan()) {
++    const bool emit_decode_marker = !q6a_direct_decode_marker_emitted_;
++    if (emit_decode_marker) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_DECODE_START step=" << step;
++    }
++    if (!embedder_context_.has_value()) {
++      return absl::InternalError("Q6A_GEMMA4_DIRECT_NO_EMBEDDER_CONTEXT");
++    }
++    if (!embedder_per_layer_context_.has_value()) {
++      return absl::InternalError(
++          "Q6A_GEMMA4_DIRECT_NO_PER_LAYER_EMBEDDER_CONTEXT");
++    }
++
++    const int id = token->id();
++    if (step < 0 ||
++        static_cast<uint32_t>(step) >= executor_settings_.GetMaxNumTokens()) {
++      return absl::ResourceExhaustedError(absl::StrCat(
++          "Q6A_GEMMA4_CONTEXT_EXHAUSTED_DECODE step=", step,
++          " max_tokens=", executor_settings_.GetMaxNumTokens()));
++    }
++    auto& llm_inputs = llm_inference_context_.decode_input_buffers;
++
++    if (llm_inputs.contains(LlmSignatures::kInputEmbeddings)) {
++      llm_inputs[LlmSignatures::kInputEmbeddings].Clear();
++    }
++    if (llm_inputs.contains(kPerLayerEmbedderTensor)) {
++      llm_inputs[kPerLayerEmbedderTensor].Clear();
++    }
++
++    RETURN_IF_ERROR(Q6AFillOneTokenId(
++        embedder_context_->inference_context
++            .decode_input_buffers[EmbedderSignatures::kEmbedderInput],
++        id));
++
++    auto embedder_res = embedder_context_->embedder_compiled_model.Run(
++        "embedder", embedder_context_->inference_context.decode_input_buffers,
++        embedder_context_->inference_context.decode_output_buffers);
++    RET_CHECK(embedder_res)
++        << "Q6A_GEMMA4_DIRECT_DECODE_EMBEDDER_FAILED: "
++        << embedder_res.Error().Message();
++
++    RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++        embedder_context_->inference_context
++            .decode_output_buffers[EmbedderSignatures::kEmbedderOutput],
++        llm_inputs[LlmSignatures::kInputEmbeddings], 0));
++
++    RETURN_IF_ERROR(Q6AFillOneTokenId(
++        embedder_per_layer_context_->inference_context.decode_input_buffers
++            [EmbedderPerLayerSignatures::kEmbedderInput],
++        id));
++
++    auto per_layer_res =
++        embedder_per_layer_context_->embedder_per_layer_compiled_model.Run(
++            "per_layer_embedder",
++            embedder_per_layer_context_->inference_context.decode_input_buffers,
++            embedder_per_layer_context_->inference_context.decode_output_buffers);
++    RET_CHECK(per_layer_res)
++        << "Q6A_GEMMA4_DIRECT_DECODE_PER_LAYER_EMBEDDER_FAILED: "
++        << per_layer_res.Error().Message();
++
++    RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++        embedder_per_layer_context_->inference_context.decode_output_buffers
++            [EmbedderPerLayerSignatures::kEmbedderOutput],
++        llm_inputs[kPerLayerEmbedderTensor], 0));
++
++    if (llm_inputs.contains("input_pos")) {
++      RETURN_IF_ERROR(Q6AFillInputPositions(llm_inputs["input_pos"], step, 1));
++    }
++    if (llm_inputs.contains("mask")) {
++      RETURN_IF_ERROR(InitializeAttentionMask(llm_inputs["mask"],
++                                              /*is_f16=*/false));
++      RETURN_IF_ERROR(FillAttentionMask(llm_inputs["mask"], step, 1));
++    }
++    if (llm_inputs.contains("param_tensor")) {
++      RETURN_IF_ERROR(
++          FillSingleBufferCacheParamTensor(llm_inputs["param_tensor"], step, 1));
++    }
++
++    auto res = llm_compiled_model_.Run(
++        LlmSignatures::kDecodeLlm, llm_inference_context_.decode_input_buffers,
++        llm_inference_context_.decode_output_buffers);
++    RET_CHECK(res) << "Q6A_GEMMA4_DIRECT_DECODE_RUNTIME_FAILED: "
++                   << res.Error().Message();
++
++    LITERT_ASSIGN_OR_RETURN(
++        int sampled_id,
++        ApplyGreedySampling(
++            llm_inference_context_
++                .decode_output_buffers[LlmSignatures::kDecodeLogitsOutput]));
++    if (emit_decode_marker) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_LOGITS_READ_OK sampled_id=" << sampled_id;
++    }
++
++    RETURN_IF_ERROR(Gemma4KvCacheBinder::BindDecodeState(
++        llm_inference_context_.decode_output_buffers,
++        llm_inference_context_.decode_input_buffers));
++
++    if (emit_decode_marker) {
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_DECODE_DONE step=" << step;
++      q6a_direct_decode_marker_emitted_ = true;
++    }
++
++    return absl::OkStatus();
++  }
++
+   int id = token->id();
+   auto start_prepare_inputs = absl::Now();
+
+@@ -1956,7 +2930,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+
+     // Decode input tokens.
+     RETURN_IF_ERROR(SetFirstElement(
+-        embedder_context_.inference_context
++        embedder_context_->inference_context
+             .decode_input_buffers[EmbedderSignatures::kEmbedderInput],
+         id));
+
+@@ -1966,17 +2940,16 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+
+     // 1. RoPE position
+     RETURN_IF_ERROR(SetFirstElement(
+-        rope_context_.decode_input_buffers[RopeSignatures::kInputPos], step));
++        rope_context_->decode_input_buffers[RopeSignatures::kInputPos], step));
+
+     // 2. Mask timestep
+     RETURN_IF_ERROR(SetFirstElement(
+-        mask_context_.decode_input_buffers[MaskSignatures::kMaskInputTimeStep],
++        mask_context_->decode_input_buffers[MaskSignatures::kMaskInputTimeStep],
+         step));
+
+     // 3. Cache update position
+     RETURN_IF_ERROR(SetFirstElement(
+-        cache_update_inference_context_
+-            .decode_input_buffers[CacheUpdateSignatures::kInputPos],
++        cache_update_inference_context_->decode_input_buffers[CacheUpdateSignatures::kInputPos],
+         step));
+   }
+
+@@ -1989,10 +2962,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+     // lookup manager to do it for us.
+     {
+       auto start = absl::Now();
+-      auto res = embedder_context_.embedder_compiled_model.Run(
++      auto res = embedder_context_->embedder_compiled_model.Run(
+           EmbedderSignatures::kDecodeEmbedder,
+-          embedder_context_.inference_context.decode_input_buffers,
+-          embedder_context_.inference_context.decode_output_buffers);
++          embedder_context_->inference_context.decode_input_buffers,
++          embedder_context_->inference_context.decode_output_buffers);
+       RET_CHECK(res) << "Failed to run embedder model."
+                      << res.Error().Message();
+       auto end = absl::Now();
+@@ -2044,9 +3017,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+   // Invoke RoPE signature.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-        RopeSignatures::kDecodeRope, rope_context_.decode_input_buffers,
+-        rope_context_.decode_output_buffers);
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++        RopeSignatures::kDecodeRope, rope_context_->decode_input_buffers,
++        rope_context_->decode_output_buffers);
+     RET_CHECK(res) << "Failed to run RoPE model." << res.Error().Message();
+     auto end = absl::Now();
+     latency_stats_.decode_rope_inference_latency_us +=
+@@ -2056,9 +3029,9 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+   // Invoke mask signature.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-        MaskSignatures::kDecodeMask, mask_context_.decode_input_buffers,
+-        mask_context_.decode_output_buffers);
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++        MaskSignatures::kDecodeMask, mask_context_->decode_input_buffers,
++        mask_context_->decode_output_buffers);
+     RET_CHECK(res) << "Failed to run compiled model." << res.Error().Message();
+     auto end = absl::Now();
+     latency_stats_.decode_mask_inference_latency_us +=
+@@ -2080,10 +3053,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+   // Cache update.
+   {
+     auto start = absl::Now();
+-    auto res = npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
++    auto res = npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
+         CacheUpdateSignatures::kDecodeCacheUpdate,
+-        cache_update_inference_context_.decode_input_buffers,
+-        cache_update_inference_context_.decode_output_buffers);
++        cache_update_inference_context_->decode_input_buffers,
++        cache_update_inference_context_->decode_output_buffers);
+     RET_CHECK(res) << "Failed to run cache update model."
+                    << res.Error().Message();
+     auto end = absl::Now();
+@@ -2096,6 +3069,152 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::DecodeInternal(
+ absl::StatusOr<std::vector<int>>
+ LlmLiteRtNpuCompiledModelExecutor::RunDrafterLoop(int start_step,
+                                                   int current_token_id) {
++  if (UsesGemma4DirectPlan()) {
++    if (!drafter_context_.has_value()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_FAIL drafter_context_missing";
++      return absl::InternalError("Direct MTP drafter context not initialized.");
++    }
++    if (!embedder_context_.has_value()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_FAIL embedder_context_missing";
++      return absl::InternalError("Direct MTP embedder context not available.");
++    }
++    LITERT_ASSIGN_OR_RETURN(
++        RankedTensorType verify_output_tensor_type,
++        llm_inference_context_
++            .verify_output_buffers[MtpSignatures::kInputActivations]
++            .TensorType());
++    const int drafter_sequence_length =
++        verify_output_tensor_type.Layout().Dimensions()[1] - 1;
++    auto& ctx = drafter_context_.value();
++
++    std::vector<uint8_t> current_activations;
++    if (!has_valid_verify_activations_) {
++      LITERT_ASSIGN_OR_RETURN(
++          current_activations,
++          CopyRawBytesFromTensorBuffer(
++              llm_inference_context_.decode_output_buffers
++                  [LlmSignatures::kLastLayerActivationsOutput]));
++    } else {
++      current_activations = last_verify_activations_;
++    }
++
++    std::vector<int> draft_tokens;
++    int input_token_id = current_token_id;
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_CPU_DRAFTER_START position=" << start_step
++                      << " token_id=" << current_token_id
++                      << " direct=1";
++    }
++
++    if (ctx.mtp_input_buffers.contains(MtpSignatures::kInputPos)) {
++      RETURN_IF_ERROR(Q6AFillInputPositions(
++          ctx.mtp_input_buffers[MtpSignatures::kInputPos], start_step, 1));
++    }
++    if (ctx.mtp_input_buffers.contains("mask")) {
++      RETURN_IF_ERROR(InitializeAttentionMask(ctx.mtp_input_buffers["mask"],
++                                              /*is_f16=*/false));
++      RETURN_IF_ERROR(
++          FillAttentionMask(ctx.mtp_input_buffers["mask"], start_step, 1));
++    }
++    if (ctx.mtp_input_buffers.contains("param_tensor")) {
++      RETURN_IF_ERROR(FillSingleBufferCacheParamTensor(
++          ctx.mtp_input_buffers["param_tensor"], start_step, 1));
++    }
++    for (auto& [name, input_buffer] : ctx.mtp_input_buffers) {
++      if (!Q6AIsKvCacheBufferName(name)) {
++        continue;
++      }
++      if (!llm_inference_context_.decode_input_buffers.contains(name)) {
++        return absl::FailedPreconditionError(absl::StrCat(
++            "Direct MTP drafter KV input missing from decode state: ", name));
++      }
++      RETURN_IF_ERROR(Q6ACopyTensorBuffer(
++          llm_inference_context_.decode_input_buffers[name], input_buffer));
++    }
++
++    for (int i = 0; i < drafter_sequence_length; ++i) {
++      RETURN_IF_ERROR(Q6AFillOneTokenId(
++          embedder_context_->inference_context
++              .decode_input_buffers[EmbedderSignatures::kEmbedderInput],
++          input_token_id));
++      auto embedder_res = embedder_context_->embedder_compiled_model.Run(
++          "embedder", embedder_context_->inference_context.decode_input_buffers,
++          embedder_context_->inference_context.decode_output_buffers);
++      RET_CHECK(embedder_res)
++          << "Q6A_HYBRID_STEP_FAIL drafter_embedder_failed: "
++          << embedder_res.Error().Message();
++
++      {
++        LITERT_ASSIGN_OR_RETURN(
++            auto embedding_lock,
++            ::litert::TensorBufferScopedLock::Create(
++                embedder_context_->inference_context
++                    .decode_output_buffers[EmbedderSignatures::kEmbedderOutput],
++                ::litert::TensorBuffer::LockMode::kRead));
++        LITERT_ASSIGN_OR_RETURN(
++            auto embedding_size,
++            embedder_context_->inference_context
++                .decode_output_buffers[EmbedderSignatures::kEmbedderOutput]
++                .PackedSize());
++        LITERT_ASSIGN_OR_RETURN(
++            auto drafter_activations_lock,
++            ::litert::TensorBufferScopedLock::Create(
++                ctx.mtp_input_buffers[MtpSignatures::kInputActivations],
++                ::litert::TensorBuffer::LockMode::kWrite));
++        LITERT_ASSIGN_OR_RETURN(
++            auto drafter_activation_size,
++            ctx.mtp_input_buffers[MtpSignatures::kInputActivations]
++                .PackedSize());
++        if (embedding_size + current_activations.size() >
++            drafter_activation_size) {
++          return absl::InvalidArgumentError(absl::StrCat(
++              "Direct MTP drafter activations buffer too small: embedding=",
++              embedding_size, " activations=", current_activations.size(),
++              " dst=", drafter_activation_size));
++        }
++        auto* base_ptr =
++            static_cast<uint8_t*>(drafter_activations_lock.second);
++        std::memset(base_ptr, 0, drafter_activation_size);
++        std::memcpy(base_ptr, embedding_lock.second, embedding_size);
++        std::memcpy(base_ptr + embedding_size, current_activations.data(),
++                    current_activations.size());
++      }
++
++      const auto draft_start = absl::Now();
++      LITERT_RETURN_IF_ERROR(ctx.mtp_compiled_model.Run(
++          MtpSignatures::kMtpDrafter, ctx.mtp_input_buffers,
++          ctx.mtp_output_buffers));
++      latency_stats_.decode_drafter_inference_latency_us +=
++          absl::ToInt64Microseconds(absl::Now() - draft_start);
++
++      LITERT_ASSIGN_OR_RETURN(
++          int draft_id,
++          ApplyGreedySampling(
++              ctx.mtp_output_buffers[MtpSignatures::kOutputLogits]));
++      draft_tokens.push_back(draft_id);
++      input_token_id = draft_id;
++      if (!Q6AHybridQuietMode()) {
++        ABSL_LOG(ERROR) << "Q6A_CPU_DRAFT_TOKENS step=" << i
++                        << " token=" << draft_id;
++      }
++
++      if (i < drafter_sequence_length - 1) {
++        LITERT_ASSIGN_OR_RETURN(
++            current_activations,
++            CopyRawBytesFromTensorBuffer(
++                ctx.mtp_output_buffers[MtpSignatures::kOutputActivations]));
++      }
++    }
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_CPU_DRAFT_TOKEN_COUNT count="
++                      << draft_tokens.size();
++      ABSL_LOG(ERROR) << "Q6A_CPU_DRAFT_TOKENS draft=["
++                      << absl::StrJoin(draft_tokens, ",") << "]";
++      ABSL_LOG(ERROR) << "Q6A_CPU_DRAFTER_OUTPUT_OK count="
++                      << draft_tokens.size();
++    }
++    return draft_tokens;
++  }
+   if (!drafter_context_.has_value() || !drafter_aux_context_.has_value()) {
+     return absl::InternalError("Drafter contexts not initialized.");
+   }
+@@ -2308,8 +3427,117 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RunVerifierBatch(
+     verify_ids.push_back(id);
+   }
+
++  if (UsesGemma4DirectPlan()) {
++    if (!embedder_context_.has_value() ||
++        !embedder_per_layer_context_.has_value()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_FAIL direct_verify_embedder_missing";
++      return absl::InternalError(
++          "Direct MTP verify requires embedder and per-layer embedder.");
++    }
++    auto& verify_inputs = llm_inference_context_.verify_input_buffers;
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_VERIFY_OUTPUT_MAP_START outputs="
++                      << llm_inference_context_.verify_output_buffers.size();
++      for (auto& [output_name, output_buffer] :
++           llm_inference_context_.verify_output_buffers) {
++        LITERT_ASSIGN_OR_RETURN(auto output_type, output_buffer.TensorType());
++        LITERT_ASSIGN_OR_RETURN(size_t output_elements,
++                                output_type.Layout().NumElements());
++        ABSL_LOG(ERROR) << "Q6A_VERIFY_OUTPUT_NAME name=" << output_name
++                        << " rank=" << output_type.Layout().Rank()
++                        << " elements=" << output_elements
++                        << " dtype="
++                        << static_cast<int>(output_type.ElementType());
++      }
++    }
++
++    for (int i = 0; i < verify_ids.size(); ++i) {
++      RETURN_IF_ERROR(Q6AFillOneTokenId(
++          embedder_context_->inference_context
++              .decode_input_buffers[EmbedderSignatures::kEmbedderInput],
++          verify_ids[i]));
++      auto embedder_res = embedder_context_->embedder_compiled_model.Run(
++          "embedder", embedder_context_->inference_context.decode_input_buffers,
++          embedder_context_->inference_context.decode_output_buffers);
++      RET_CHECK(embedder_res)
++          << "Q6A_HYBRID_STEP_FAIL verify_embedder_failed: "
++          << embedder_res.Error().Message();
++      RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++          embedder_context_->inference_context
++              .decode_output_buffers[EmbedderSignatures::kEmbedderOutput],
++          verify_inputs[LlmSignatures::kInputEmbeddings], i));
++
++      RETURN_IF_ERROR(Q6AFillOneTokenId(
++          embedder_per_layer_context_->inference_context.decode_input_buffers
++              [EmbedderPerLayerSignatures::kEmbedderInput],
++          verify_ids[i]));
++      auto per_layer_res =
++          embedder_per_layer_context_->embedder_per_layer_compiled_model.Run(
++              "per_layer_embedder",
++              embedder_per_layer_context_->inference_context
++                  .decode_input_buffers,
++              embedder_per_layer_context_->inference_context
++                  .decode_output_buffers);
++      RET_CHECK(per_layer_res)
++          << "Q6A_HYBRID_STEP_FAIL verify_per_layer_embedder_failed: "
++          << per_layer_res.Error().Message();
++      RETURN_IF_ERROR(Q6ACopyOneTokenBufferToPrefillSlot(
++          embedder_per_layer_context_->inference_context.decode_output_buffers
++              [EmbedderPerLayerSignatures::kEmbedderOutput],
++          verify_inputs[kPerLayerEmbedderTensor], i));
++    }
++    if (verify_inputs.contains("input_pos")) {
++      RETURN_IF_ERROR(Q6AFillInputPositions(verify_inputs["input_pos"],
++                                            start_step, verify_ids.size()));
++    }
++    if (verify_inputs.contains("mask")) {
++      RETURN_IF_ERROR(InitializeAttentionMask(verify_inputs["mask"],
++                                              /*is_f16=*/false));
++      RETURN_IF_ERROR(
++          FillAttentionMask(verify_inputs["mask"], start_step,
++                            static_cast<int>(verify_ids.size())));
++    }
++    if (verify_inputs.contains("param_tensor")) {
++      RETURN_IF_ERROR(FillSingleBufferCacheParamTensor(
++          verify_inputs["param_tensor"], start_step, verify_ids.size()));
++    }
++    for (auto& [name, verify_input_buffer] : verify_inputs) {
++      if (!Q6AIsKvCacheBufferName(name)) {
++        continue;
++      }
++      if (!llm_inference_context_.decode_input_buffers.contains(name)) {
++        return absl::FailedPreconditionError(absl::StrCat(
++            "Direct MTP verify KV input missing from decode state: ", name));
++      }
++      LITERT_ASSIGN_OR_RETURN(
++          verify_input_buffer,
++          llm_inference_context_.decode_input_buffers[name].Duplicate());
++      if (!Q6AHybridQuietMode()) {
++        ABSL_LOG(ERROR) << "Q6A_VERIFY_KV_ALIAS name=" << name;
++      }
++    }
++
++    ABSL_LOG(ERROR) << "Q6A_HYBRID_VERIFY_CALL start_step=" << start_step
++                    << " id_count=" << verify_ids.size();
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_VERIFY_IDS ids=["
++                      << absl::StrJoin(verify_ids, ",") << "]";
++    }
++    LITERT_RETURN_IF_ERROR(llm_compiled_model_.Run(
++        LlmSignatures::kVerifyLlm, verify_inputs,
++        llm_inference_context_.verify_output_buffers));
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_VERIFY_INVOKE_OK";
++    }
++    ABSL_LOG(ERROR) << "Q6A_NPU_VERIFY_INVOKE_OK";
++    if (!Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_VERIFY_OUTPUT_MAP_DONE";
++    }
++    return absl::OkStatus();
++  }
++
+   auto& embedder_verify_inputs =
+-      embedder_context_.inference_context.verify_input_buffers;
++      embedder_context_->inference_context.verify_input_buffers;
+
+   {
+     LITERT_ASSIGN_OR_RETURN(
+@@ -2325,7 +3553,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RunVerifierBatch(
+
+   if (UseEmbeddingLookupManager()) {
+     litert::TensorBuffer& verify_embedding_buffer =
+-        embedder_context_.inference_context
++        embedder_context_->inference_context
+             .verify_output_buffers[EmbedderSignatures::kEmbedderOutput];
+     auto start = absl::Now();
+     LITERT_RETURN_IF_ERROR(embedding_lookup_manager_->LookupPrefill(
+@@ -2369,7 +3597,7 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RunVerifierBatch(
+     LITERT_ASSIGN_OR_RETURN(
+         auto pos_lock,
+         ::litert::TensorBufferScopedLock::Create(
+-            rope_context_.verify_input_buffers[RopeSignatures::kInputPos],
++            rope_context_->verify_input_buffers[RopeSignatures::kInputPos],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     auto* pos_ptr = static_cast<int32_t*>(pos_lock.second);
+     std::vector<int> verify_pos_ids;
+@@ -2385,16 +3613,14 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RunVerifierBatch(
+     LITERT_ASSIGN_OR_RETURN(
+         auto mask_step_lock,
+         ::litert::TensorBufferScopedLock::Create(
+-            mask_context_
+-                .verify_input_buffers[MaskSignatures::kMaskInputTimeStep],
++            mask_context_->verify_input_buffers[MaskSignatures::kMaskInputTimeStep],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     static_cast<int32_t*>(mask_step_lock.second)[0] = start_step;
+
+     LITERT_ASSIGN_OR_RETURN(
+         auto mask_tokens_lock,
+         ::litert::TensorBufferScopedLock::Create(
+-            mask_context_
+-                .verify_input_buffers[MaskSignatures::kMaskInputTokens],
++            mask_context_->verify_input_buffers[MaskSignatures::kMaskInputTokens],
+             ::litert::TensorBuffer::LockMode::kWrite));
+     auto* mask_tokens_ptr = static_cast<int32_t*>(mask_tokens_lock.second);
+     for (int i = 0; i < verify_ids.size(); ++i) {
+@@ -2403,13 +3629,13 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RunVerifierBatch(
+   }
+
+   LITERT_RETURN_IF_ERROR(
+-      npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-          RopeSignatures::kVerifyRope, rope_context_.verify_input_buffers,
+-          rope_context_.verify_output_buffers));
++      npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++          RopeSignatures::kVerifyRope, rope_context_->verify_input_buffers,
++          rope_context_->verify_output_buffers));
+   LITERT_RETURN_IF_ERROR(
+-      npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
+-          MaskSignatures::kVerifyMask, mask_context_.verify_input_buffers,
+-          mask_context_.verify_output_buffers));
++      npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
++          MaskSignatures::kVerifyMask, mask_context_->verify_input_buffers,
++          mask_context_->verify_output_buffers));
+
+   LITERT_RETURN_IF_ERROR(llm_compiled_model_.Run(
+       LlmSignatures::kVerifyLlm, llm_inference_context_.verify_input_buffers,
+@@ -2437,6 +3663,11 @@ LlmLiteRtNpuCompiledModelExecutor::PerformRejectionSampling(
+
+   for (int i = 0; i < draft_tokens.size(); ++i) {
+     int sampled_verifier_token = all_verifier_sampled[i];
++    if (UsesGemma4DirectPlan() && !Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_VERIFY_ACCEPT_CANDIDATE idx=" << i
++                      << " draft=" << draft_tokens[i]
++                      << " verifier=" << sampled_verifier_token;
++    }
+
+     NPU_EXECUTOR_LOG(INFO) << "    [RS] Step " << i << ": Drafter Token "
+                            << draft_tokens[i] << " vs Verifier Sampled Token "
+@@ -2457,25 +3688,82 @@ LlmLiteRtNpuCompiledModelExecutor::PerformRejectionSampling(
+   }
+   latency_stats_.mtp_num_draft_tokens += draft_tokens.size();
+   latency_stats_.mtp_num_accepted_tokens += num_accepted;
++  if (UsesGemma4DirectPlan()) {
++    if (Q6AHybridQuietMode()) {
++      ABSL_LOG(ERROR) << "Q6A_VERIFY_ACCEPT_COUNT_READ_OK accepted="
++                      << num_accepted << " bonus=" << bonus_token_id;
++    } else {
++      ABSL_LOG(ERROR) << "Q6A_VERIFY_ACCEPT_COUNT_READ_OK accepted="
++                      << num_accepted << " bonus=" << bonus_token_id
++                      << " verifier=["
++                      << absl::StrJoin(all_verifier_sampled, ",") << "]";
++    }
++  }
+
+   return RejectionSamplingResult{num_accepted, bonus_token_id};
+ }
+
+ absl::Status LlmLiteRtNpuCompiledModelExecutor::CommitVerifiedKVCache(
+     int start_step) {
++  if (UsesGemma4DirectPlan()) {
++    if (Q6AEnvFlagEnabled("Q6A_HYBRID_KV_ALIAS_COMMIT")) {
++      int aliased = 0;
++      for (auto& [name, output_buffer] :
++           llm_inference_context_.verify_output_buffers) {
++        if (!Q6AIsKvCacheBufferName(name)) {
++          continue;
++        }
++        if (!llm_inference_context_.decode_input_buffers.contains(name)) {
++          return absl::FailedPreconditionError(absl::StrCat(
++              "Direct MTP alias commit KV input missing from decode state: ",
++              name));
++        }
++        LITERT_ASSIGN_OR_RETURN(auto alias_buffer, output_buffer.Duplicate());
++        llm_inference_context_.decode_input_buffers[name] =
++            std::move(alias_buffer);
++        ++aliased;
++      }
++      if (aliased == 0) {
++        return absl::FailedPreconditionError(
++            "Direct MTP alias commit found no verify kv_cache_* outputs.");
++      }
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_KV_COMMIT_ALIAS buffers=" << aliased
++                      << " start_step=" << start_step;
++      return absl::OkStatus();
++    }
++    int copied = 0;
++    for (auto& [name, output_buffer] :
++         llm_inference_context_.verify_output_buffers) {
++      if (!Q6AIsKvCacheBufferName(name)) {
++        continue;
++      }
++      if (!llm_inference_context_.decode_input_buffers.contains(name)) {
++        return absl::FailedPreconditionError(absl::StrCat(
++            "Direct MTP commit KV input missing from decode state: ", name));
++      }
++      RETURN_IF_ERROR(Q6ACopyTensorBuffer(
++          output_buffer, llm_inference_context_.decode_input_buffers[name]));
++      ++copied;
++    }
++    if (copied == 0) {
++      return absl::FailedPreconditionError(
++          "Direct MTP commit found no verify kv_cache_* outputs.");
++    }
++    ABSL_LOG(ERROR) << "Q6A_HYBRID_KV_COMMIT_COPY buffers=" << copied
++                    << " start_step=" << start_step;
++    return absl::OkStatus();
++  }
+   {
+     LITERT_ASSIGN_OR_RETURN(
+         auto pos_lock, ::litert::TensorBufferScopedLock::Create(
+-                           cache_update_inference_context_
+-                               .verify_input_buffers[RopeSignatures::kInputPos],
++                           cache_update_inference_context_->verify_input_buffers[RopeSignatures::kInputPos],
+                            ::litert::TensorBuffer::LockMode::kWrite));
+     auto* pos_ptr = static_cast<int32_t*>(pos_lock.second);
+     // Use the size of the pos tensor to determine the number of tokens to
+     // commit. Input pos is 1D tensor, where dimension 0 represents the number
+     // of steps that draft model processed.
+     LITERT_ASSIGN_OR_RETURN(RankedTensorType tensor_type,
+-                            cache_update_inference_context_
+-                                .verify_input_buffers[RopeSignatures::kInputPos]
++                            cache_update_inference_context_->verify_input_buffers[RopeSignatures::kInputPos]
+                                 .TensorType());
+     int tensor_size = tensor_type.Layout().Dimensions()[0];
+     for (int i = 0; i < tensor_size; ++i) {
+@@ -2483,10 +3771,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::CommitVerifiedKVCache(
+     }
+   }
+   LITERT_RETURN_IF_ERROR(
+-      npu_auxiliary_context_.npu_auxiliary_compiled_model.Run(
++      npu_auxiliary_context_->npu_auxiliary_compiled_model.Run(
+           CacheUpdateSignatures::kVerifyCacheUpdate,
+-          cache_update_inference_context_.verify_input_buffers,
+-          cache_update_inference_context_.verify_output_buffers));
++          cache_update_inference_context_->verify_input_buffers,
++          cache_update_inference_context_->verify_output_buffers));
+   return absl::OkStatus();
+ }
+
+@@ -2508,6 +3796,8 @@ LlmLiteRtNpuCompiledModelExecutor::GetLatencyStats() const {
+ absl::Status LlmLiteRtNpuCompiledModelExecutor::Reset() {
+   ABSL_LOG(INFO) << "Custom NPU execution latency stats:\n" << latency_stats_;
+   current_step_ = 0;
++  q6a_direct_decode_marker_emitted_ = false;
++  q6a_direct_generation_marker_emitted_ = false;
+   RETURN_IF_ERROR(processed_tokens_.RollBackToStep(0));
+   sampled_ids_.clear();
+   latency_stats_ = {};
+@@ -2515,6 +3805,13 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Reset() {
+   pending_accepted_tokens_.clear();
+
+   RETURN_IF_ERROR(ClearKVCache(llm_inference_context_.prefill_input_buffers));
++  if (UsesGemma4DirectPlan()) {
++    RETURN_IF_ERROR(ClearKVCache(llm_inference_context_.decode_input_buffers));
++    if (direct_prefill_1024_inference_context_.has_value()) {
++      RETURN_IF_ERROR(ClearKVCache(
++          direct_prefill_1024_inference_context_->prefill_input_buffers));
++    }
++  }
+   return absl::OkStatus();
+ }
+
+@@ -2567,6 +3864,391 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
+     const LlmExecutorSettings& executor_settings, ModelResources& resources,
+     litert::Environment& env, const litert::Model* transformer_model,
+     LogitsQuantizationParams quantization_params) {
++  if (IsGemma4DirectCandidate(transformer_model)) {
++    ExecutionPlan direct_execution_plan = ExecutionPlan::kGemma4Direct;
++    if (HasGemma4ProductionDirectContract(transformer_model)) {
++      RETURN_IF_ERROR(Gemma4ModelContractValidator::Validate(transformer_model));
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_DIRECT_MODE_SELECTED";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_CONTRACT_OK";
++    } else if (IsGemma4ExportHfDirectCandidate(transformer_model)) {
++      RETURN_IF_ERROR(
++          Gemma4ExportHfModelContractValidator::Validate(transformer_model));
++      direct_execution_plan = ExecutionPlan::kGemma4ExportHfDirect;
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_EXPORT_HF_DIRECT_MODE_SELECTED";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_EXPORT_HF_CONTRACT_OK";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_DIRECT_MODE_SELECTED";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_CONTRACT_OK";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_RUNTIME_LOG_PROFILE=minimal";
++      ABSL_LOG(ERROR) << "Q6A_GEMMA4_KV_DECODE_SINGLE_DEST";
++    } else {
++      return absl::FailedPreconditionError(
++          "Gemma4 Direct candidate does not match a supported contract.");
++    }
++    LITERT_ASSIGN_OR_RETURN(const uint32_t direct_context_capacity,
++                            Q6AGetDirectContextCapacity(transformer_model));
++    LlmExecutorSettings direct_executor_settings = executor_settings;
++    const uint32_t configured_max_tokens =
++        direct_executor_settings.GetMaxNumTokens();
++    const uint32_t effective_max_tokens =
++        configured_max_tokens == 0
++            ? direct_context_capacity
++            : std::min(configured_max_tokens, direct_context_capacity);
++    direct_executor_settings.SetMaxNumTokens(effective_max_tokens);
++    ABSL_LOG(ERROR) << "Q6A_GEMMA4_CONTEXT_CAPACITY capacity="
++                    << direct_context_capacity
++                    << " configured_max=" << configured_max_tokens
++                    << " effective_max=" << effective_max_tokens;
++    ABSL_LOG(INFO) << "Trying direct LLM warmup without TF_LITE_AUX.";
++
++    LITERT_ASSIGN_OR_RETURN(auto options,
++                            CreateLiteRtNpuOptions(direct_executor_settings));
++    LITERT_ASSIGN_OR_RETURN(
++        CompiledModel llm_compiled_model,
++        CompiledModel::Create(env, transformer_model->Get(), options));
++
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        gemma_prefill_input_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        gemma_decode_input_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        gemma_verify_input_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer> input_kv_cache_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        prefill_output_kv_cache_slice_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        decode_output_kv_cache_slice_buffers;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        verify_output_kv_cache_slice_buffers;
++
++    RETURN_IF_ERROR(AllocateTransformerBuffers(
++        env, transformer_model, llm_compiled_model, gemma_prefill_input_buffers,
++        gemma_decode_input_buffers, gemma_verify_input_buffers,
++        input_kv_cache_buffers, prefill_output_kv_cache_slice_buffers,
++        decode_output_kv_cache_slice_buffers,
++        verify_output_kv_cache_slice_buffers));
++
++    LITERT_ASSIGN_OR_RETURN(
++        auto llm_inference_context,
++        CreateLlmInferenceContextWithBufferSharing(
++            env, llm_compiled_model, input_kv_cache_buffers,
++            prefill_output_kv_cache_slice_buffers,
++            decode_output_kv_cache_slice_buffers,
++            verify_output_kv_cache_slice_buffers, gemma_prefill_input_buffers,
++            gemma_decode_input_buffers, gemma_verify_input_buffers));
++
++    std::optional<InferenceContext> direct_prefill_1024_inference_context =
++        std::nullopt;
++    if (direct_execution_plan == ExecutionPlan::kGemma4ExportHfDirect) {
++      auto prefill_1024_signature =
++          transformer_model->FindSignature(kPrefill1024Signature);
++      if (prefill_1024_signature) {
++        absl::flat_hash_map<absl::string_view, TensorBuffer>
++            prefill_1024_input_buffers;
++        absl::flat_hash_map<absl::string_view, TensorBuffer>
++            prefill_1024_output_buffers;
++        for (auto input_name : prefill_1024_signature->InputNames()) {
++          LITERT_ASSIGN_OR_RETURN(
++              prefill_1024_input_buffers[input_name],
++              llm_compiled_model.CreateInputBuffer(kPrefill1024Signature,
++                                                   input_name));
++          prefill_1024_input_buffers[input_name].Clear();
++        }
++        for (auto output_name : prefill_1024_signature->OutputNames()) {
++          if (!Q6AIsKvCacheBufferName(output_name)) {
++            continue;
++          }
++          LITERT_ASSIGN_OR_RETURN(
++              prefill_1024_output_buffers[output_name],
++              llm_compiled_model.CreateOutputBuffer(kPrefill1024Signature,
++                                                    output_name));
++        }
++        direct_prefill_1024_inference_context = InferenceContext(
++            std::move(prefill_1024_input_buffers),
++            std::move(prefill_1024_output_buffers), {}, {});
++        ABSL_LOG(ERROR) << "Q6A_GEMMA4_PREFILL1024_AVAILABLE";
++      }
++    }
++
++    auto prepare_direct_inputs =
++        [](absl::flat_hash_map<absl::string_view, TensorBuffer>& buffers,
++           int start, int steps) -> absl::Status {
++      if (buffers.contains(LlmSignatures::kInputEmbeddings)) {
++        RETURN_IF_ERROR(Fill(buffers[LlmSignatures::kInputEmbeddings], 1));
++      }
++      if (buffers.contains(kPerLayerEmbedderTensor)) {
++        RETURN_IF_ERROR(Fill(buffers[kPerLayerEmbedderTensor], 1));
++      }
++      if (buffers.contains("input_pos")) {
++        RETURN_IF_ERROR(Q6AFillInputPositions(buffers["input_pos"], start,
++                                              steps));
++      }
++      if (buffers.contains("mask")) {
++        RETURN_IF_ERROR(InitializeAttentionMask(buffers["mask"],
++                                                /*is_f16=*/false));
++        RETURN_IF_ERROR(FillAttentionMask(buffers["mask"], start, steps));
++      }
++      if (buffers.contains("param_tensor")) {
++        RETURN_IF_ERROR(
++            FillSingleBufferCacheParamTensor(buffers["param_tensor"], start,
++                                             steps));
++      }
++      return absl::OkStatus();
++    };
++
++    RETURN_IF_ERROR(prepare_direct_inputs(
++        llm_inference_context.prefill_input_buffers, /*start=*/0,
++        /*steps=*/kPrefillSize));
++    RETURN_IF_ERROR(prepare_direct_inputs(
++        llm_inference_context.decode_input_buffers, /*start=*/0, /*steps=*/1));
++
++    if (Q6AEnvFlagEnabled("Q6A_OFFICIAL_MTP_NPU_PROBE")) {
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_MTP_NPU_ROUTE_SELECTED";
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_ARTIFACT_LOADED";
++      if (llm_inference_context.verify_input_buffers.empty() ||
++          llm_inference_context.verify_output_buffers.empty()) {
++        ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_FAIL missing_verify_io";
++        return absl::FailedPreconditionError(
++            "Official MTP/NPU probe requested but verify buffers are empty.");
++      }
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_SIGNATURE_FOUND inputs="
++                      << llm_inference_context.verify_input_buffers.size()
++                      << " outputs="
++                      << llm_inference_context.verify_output_buffers.size();
++      auto mtp_drafter_model =
++          resources.GetTFLiteModel(ModelType::kTfLiteMtpDrafter);
++      if (mtp_drafter_model.ok()) {
++        ABSL_LOG(ERROR) << "Q6A_OFFICIAL_MTP_DRAFTER_FOUND";
++      } else {
++        ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_FAIL mtp_drafter_missing: "
++                        << mtp_drafter_model.status();
++        return mtp_drafter_model.status();
++      }
++
++      int verify_steps = 1;
++      if (llm_inference_context.verify_input_buffers.contains("input_pos")) {
++        LITERT_ASSIGN_OR_RETURN(
++            auto verify_pos_type,
++            llm_inference_context.verify_input_buffers["input_pos"]
++                .TensorType());
++        const auto& dims = verify_pos_type.Layout().Dimensions();
++        if (!dims.empty()) {
++          verify_steps = dims[0];
++        }
++      }
++      RETURN_IF_ERROR(prepare_direct_inputs(
++          llm_inference_context.verify_input_buffers, /*start=*/0,
++          /*steps=*/verify_steps));
++      ABSL_LOG(ERROR) << "Q6A_NPU_VERIFY_BIND_OK";
++
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_CONTEXT_START steps="
++                      << verify_steps;
++      auto verify_result = llm_compiled_model.Run(
++          LlmSignatures::kVerifyLlm, llm_inference_context.verify_input_buffers,
++          llm_inference_context.verify_output_buffers);
++      if (!verify_result) {
++        ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_FAIL warmup: "
++                        << verify_result.Error().Message();
++        RET_CHECK(verify_result)
++            << "Q6A_OFFICIAL_VERIFY_NPU_FAIL warmup: "
++            << verify_result.Error().Message();
++      }
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_CONTEXT_OK";
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_WARMUP_OK";
++
++      RETURN_IF_ERROR(prepare_direct_inputs(
++          llm_inference_context.verify_input_buffers, /*start=*/0,
++          /*steps=*/verify_steps));
++      verify_result = llm_compiled_model.Run(
++          LlmSignatures::kVerifyLlm, llm_inference_context.verify_input_buffers,
++          llm_inference_context.verify_output_buffers);
++      if (!verify_result) {
++        ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_FAIL invoke: "
++                        << verify_result.Error().Message();
++        RET_CHECK(verify_result)
++            << "Q6A_OFFICIAL_VERIFY_NPU_FAIL invoke: "
++            << verify_result.Error().Message();
++      }
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_NPU_INVOKE_OK";
++      ABSL_LOG(ERROR) << "Q6A_NPU_VERIFY_INVOKE_OK";
++
++      int outputs_read = 0;
++      for (auto& [output_name, output_buffer] :
++           llm_inference_context.verify_output_buffers) {
++        LITERT_ASSIGN_OR_RETURN(auto output_type, output_buffer.TensorType());
++        (void)output_type;
++        LITERT_ASSIGN_OR_RETURN(
++            auto output_lock,
++            ::litert::TensorBufferScopedLock::Create(
++                output_buffer, ::litert::TensorBuffer::LockMode::kRead));
++        (void)output_lock;
++        ++outputs_read;
++      }
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_VERIFY_OUTPUT_READ_OK outputs_read="
++                      << outputs_read;
++      ABSL_LOG(ERROR) << "Q6A_NPU_VERIFY_ACCEPT_READ_OK outputs_read="
++                      << outputs_read;
++    }
++
++    auto result = llm_compiled_model.Run(
++        LlmSignatures::kPrefillLlm,
++        llm_inference_context.prefill_input_buffers,
++        llm_inference_context.prefill_output_buffers);
++    RET_CHECK(result) << "Q6A_GEMMA4_DIRECT_PREFILL_FAILED: "
++                      << result.Error().Message();
++
++    result = llm_compiled_model.Run(
++        LlmSignatures::kDecodeLlm, llm_inference_context.decode_input_buffers,
++        llm_inference_context.decode_output_buffers);
++    RET_CHECK(result) << "Q6A_GEMMA4_DIRECT_DECODE_FAILED: "
++                      << result.Error().Message();
++
++    LITERT_ASSIGN_OR_RETURN(auto embedder_lrt_model,
++                            resources.GetTFLiteModel(ModelType::kTfLiteEmbedder));
++    LITERT_ASSIGN_OR_RETURN(
++        auto embedder_per_layer_lrt_model,
++        resources.GetTFLiteModel(ModelType::kTfLitePerLayerEmbedder));
++
++    LITERT_ASSIGN_OR_RETURN(auto cpu_options,
++                            CreateLiteRtCpuOptions(direct_executor_settings));
++
++    LITERT_ASSIGN_OR_RETURN(
++        CompiledModel direct_embedder_compiled_model,
++        CompiledModel::Create(env, embedder_lrt_model->Get(), cpu_options));
++    LITERT_ASSIGN_OR_RETURN(
++        CompiledModel direct_per_layer_compiled_model,
++        CompiledModel::Create(env, embedder_per_layer_lrt_model->Get(),
++                              cpu_options));
++
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_embedder_prefill_inputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_embedder_prefill_outputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_embedder_decode_inputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_embedder_decode_outputs;
++
++    LITERT_ASSIGN_OR_RETURN(
++        direct_embedder_prefill_inputs[EmbedderSignatures::kEmbedderInput],
++        direct_embedder_compiled_model.CreateInputBuffer(
++            "embedder", "token_ids"));
++    LITERT_ASSIGN_OR_RETURN(
++        direct_embedder_prefill_outputs[EmbedderSignatures::kEmbedderOutput],
++        direct_embedder_compiled_model.CreateOutputBuffer(
++            "embedder", "embeddings"));
++
++    LITERT_ASSIGN_OR_RETURN(
++        direct_embedder_decode_inputs[EmbedderSignatures::kEmbedderInput],
++        direct_embedder_compiled_model.CreateInputBuffer(
++            "embedder", "token_ids"));
++    LITERT_ASSIGN_OR_RETURN(
++        direct_embedder_decode_outputs[EmbedderSignatures::kEmbedderOutput],
++        direct_embedder_compiled_model.CreateOutputBuffer(
++            "embedder", "embeddings"));
++
++    EmbedderContext direct_embedder_context(
++        std::move(direct_embedder_compiled_model),
++        std::move(direct_embedder_prefill_inputs),
++        std::move(direct_embedder_prefill_outputs),
++        std::move(direct_embedder_decode_inputs),
++        std::move(direct_embedder_decode_outputs));
++
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_per_layer_prefill_inputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_per_layer_prefill_outputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_per_layer_decode_inputs;
++    absl::flat_hash_map<absl::string_view, TensorBuffer>
++        direct_per_layer_decode_outputs;
++
++    LITERT_ASSIGN_OR_RETURN(
++        direct_per_layer_prefill_inputs
++            [EmbedderPerLayerSignatures::kEmbedderInput],
++        direct_per_layer_compiled_model.CreateInputBuffer(
++            "per_layer_embedder", "token_ids"));
++    LITERT_ASSIGN_OR_RETURN(
++        direct_per_layer_prefill_outputs
++            [EmbedderPerLayerSignatures::kEmbedderOutput],
++        direct_per_layer_compiled_model.CreateOutputBuffer(
++            "per_layer_embedder", "embeddings"));
++
++    LITERT_ASSIGN_OR_RETURN(
++        direct_per_layer_decode_inputs
++            [EmbedderPerLayerSignatures::kEmbedderInput],
++        direct_per_layer_compiled_model.CreateInputBuffer(
++            "per_layer_embedder", "token_ids"));
++    LITERT_ASSIGN_OR_RETURN(
++        direct_per_layer_decode_outputs
++            [EmbedderPerLayerSignatures::kEmbedderOutput],
++        direct_per_layer_compiled_model.CreateOutputBuffer(
++            "per_layer_embedder", "embeddings"));
++
++    EmbedderPerLayerContext direct_embedder_per_layer_context(
++        std::move(direct_per_layer_compiled_model),
++        std::move(direct_per_layer_prefill_inputs),
++        std::move(direct_per_layer_prefill_outputs),
++        std::move(direct_per_layer_decode_inputs),
++        std::move(direct_per_layer_decode_outputs));
++
++    SortedPrefillSignatureMap prefill_runner_set;
++    prefill_runner_set[kPrefillSize] = std::string(kPrefillSignature);
++    if (direct_prefill_1024_inference_context.has_value()) {
++      prefill_runner_set[kPrefill1024Size] =
++          std::string(kPrefill1024Signature);
++    }
++
++    std::unique_ptr<EmbeddingLookupManager> no_embedding_lookup_manager;
++    SpeculativeDecodingType direct_speculative_decoding_type =
++        SpeculativeDecodingType::kNone;
++    std::optional<DrafterContext> direct_drafter_context = std::nullopt;
++    if (Q6AEnvFlagEnabled("Q6A_OFFICIAL_MTP_NPU_HYBRID")) {
++      auto mtp_drafter_model =
++          resources.GetTFLiteModel(ModelType::kTfLiteMtpDrafter);
++      if (!mtp_drafter_model.ok()) {
++        ABSL_LOG(ERROR) << "Q6A_HYBRID_STEP_FAIL mtp_drafter_missing: "
++                        << mtp_drafter_model.status();
++        return mtp_drafter_model.status();
++      }
++      if (!llm_inference_context.decode_output_buffers.contains(
++              LlmSignatures::kLastLayerActivationsOutput)) {
++        return absl::FailedPreconditionError(
++            "Q6A_HYBRID_STEP_FAIL missing_decode_activations_output");
++      }
++      LITERT_ASSIGN_OR_RETURN(
++          direct_drafter_context,
++          CreateDrafterInferenceContextWithBufferSharing(
++              env, **mtp_drafter_model, input_kv_cache_buffers,
++              llm_inference_context.decode_output_buffers
++                  [LlmSignatures::kLastLayerActivationsOutput]));
++      direct_speculative_decoding_type = SpeculativeDecodingType::kMTP;
++      ABSL_LOG(ERROR) << "Q6A_HYBRID_LOOP_START init=1";
++      ABSL_LOG(ERROR) << "Q6A_OFFICIAL_MTP_DRAFTER_FOUND";
++    }
++
++    auto executor = absl::WrapUnique(new LlmLiteRtNpuCompiledModelExecutor(
++        std::move(direct_executor_settings), env,
++        /*embedder_context=*/std::optional<EmbedderContext>(std::move(direct_embedder_context)),
++        /*npu_auxiliary_context=*/std::nullopt,
++        /*mask_context=*/std::nullopt,
++        /*rope_context=*/std::nullopt,
++        std::move(llm_compiled_model),
++        std::move(llm_inference_context),
++        /*cache_update_inference_context=*/std::nullopt,
++        std::move(prefill_runner_set),
++        std::move(no_embedding_lookup_manager),
++        /*embedder_per_layer_context=*/std::optional<EmbedderPerLayerContext>(std::move(direct_embedder_per_layer_context)),
++        quantization_params,
++        direct_speculative_decoding_type,
++        /*drafter_context=*/std::move(direct_drafter_context),
++        /*drafter_aux_context=*/std::nullopt,
++        /*execution_plan=*/direct_execution_plan,
++        /*direct_prefill_1024_inference_context=*/
++            std::move(direct_prefill_1024_inference_context)));
++
++    return executor;
++  }
++
+   // If the model is fully AOT compiled for NPU, NPU accelerator is used
+   // automatically.
+   LITERT_ASSIGN_OR_RETURN(auto options,

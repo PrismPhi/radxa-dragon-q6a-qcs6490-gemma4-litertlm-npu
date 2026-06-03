@@ -1,0 +1,23 @@
+Q6A Gemma4 LiteRT-LM NPU Runtime Patches
+
+This repository contains source patches, scripts, and documentation for
+running Gemma 4 E2B with LiteRT-LM on Radxa Dragon Q6A / Qualcomm QCS6490.
+
+This repository does not redistribute:
+
+- Qualcomm QAIRT/QNN runtime libraries
+- Gemma model weights
+- LiteRT-LM model containers (`.litertlm`)
+- QNN context binaries
+
+Users must obtain third-party components from their own properly licensed
+sources and comply with the applicable terms.
+
+Portions of the patch targets are derived from or intended to be applied to
+Google LiteRT-LM / LiteRT projects, which are Apache-2.0 licensed.
+
+Gemma 4 E2B model artifacts are provided by Google / LiteRT community under
+their applicable model licenses. See `THIRD_PARTY_NOTICES.md`.
+
+This repository and its documentation were prepared with substantial assistance
+from OpenAI Codex. The maintainer is responsible for the published contents.

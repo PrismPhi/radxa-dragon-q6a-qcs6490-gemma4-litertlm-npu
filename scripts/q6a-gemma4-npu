@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORK="${Q6A_GEMMA4_NPU_ROOT:-${HOME}/q6a-gemma4-npu}"
+MODEL_DEFAULT="$WORK/packages/gemma4_e2b_q6a_qcs6490_ctx1024_npu.litertlm"
+RUNTIME="$WORK/runtime/litert_lm_main_q6a_gemma4_npu"
+LOG_DIR="$WORK/logs"
+PROMPT_DIR="$WORK/prompts"
+mkdir -p "$LOG_DIR" "$PROMPT_DIR"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  q6a-gemma4-npu run MODEL --backend npu --prompt TEXT [--max-num-tokens N]
+  q6a-gemma4-npu run MODEL --backend npu --prompt-file FILE
+
+Options:
+  --backend npu        Required for the Q6A NPU route.
+  --prompt TEXT        Prompt text. Prefer --prompt-file for UTF-8 safety.
+  --prompt-file FILE   Read prompt from UTF-8 file.
+  --max-num-tokens N   Requested output tokens. Clamped to ctx1024 safety budget.
+  --temperature T      Default: 0.
+  --debug-stderr       Also print backend stderr markers to terminal.
+  --quiet              Print only generated stdout.
+
+Environment:
+  Q6A_GEMMA4_NPU_ROOT       Default: ${HOME}/q6a-gemma4-npu
+  Q6A_GEMMA4_NPU_TIMEOUT    Default: 300
+USAGE
+}
+
+if [[ $# -lt 1 ]]; then usage; exit 2; fi
+if [[ "$1" == "run" ]]; then shift; fi
+
+MODEL="$MODEL_DEFAULT"
+if [[ $# -gt 0 && "$1" != --* ]]; then MODEL="$1"; shift; fi
+
+BACKEND="npu"
+PROMPT=""
+PROMPT_FILE=""
+MAX_TOKENS=256
+TEMPERATURE=0
+DEBUG_STDERR=0
+QUIET=0
+TIMEOUT_SECS="${Q6A_GEMMA4_NPU_TIMEOUT:-300}"
+CTX_CAPACITY="${Q6A_GEMMA4_NPU_CTX1024_CAPACITY:-1024}"
+SAFETY_MARGIN="${Q6A_GEMMA4_NPU_CTX1024_SAFETY_MARGIN:-32}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend) BACKEND="$2"; shift 2 ;;
+    --backend=*) BACKEND="${1#--backend=}"; shift ;;
+    --prompt) PROMPT="$2"; shift 2 ;;
+    --prompt=*) PROMPT="${1#--prompt=}"; shift ;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --prompt-file=*) PROMPT_FILE="${1#--prompt-file=}"; shift ;;
+    --max-num-tokens|--max-output-tokens) MAX_TOKENS="$2"; shift 2 ;;
+    --max-num-tokens=*|--max-output-tokens=*) MAX_TOKENS="${1#*=}"; shift ;;
+    --temperature) TEMPERATURE="$2"; shift 2 ;;
+    --temperature=*) TEMPERATURE="${1#--temperature=}"; shift ;;
+    --debug-stderr) DEBUG_STDERR=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ "$BACKEND" != "npu" ]]; then
+  echo "This Q6A runner only supports --backend npu." >&2
+  exit 2
+fi
+if [[ ! -x "$RUNTIME" ]]; then
+  echo "Missing runtime: $RUNTIME" >&2
+  exit 1
+fi
+if [[ ! -r "$MODEL" ]]; then
+  echo "Missing model: $MODEL" >&2
+  exit 1
+fi
+if [[ ! "$MAX_TOKENS" =~ ^[0-9]+$ || "$MAX_TOKENS" -le 0 ]]; then
+  echo "--max-num-tokens must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ -z "$PROMPT_FILE" ]]; then
+  PROMPT_FILE="$PROMPT_DIR/prompt_$(date +%Y%m%d_%H%M%S)_$$.txt"
+  printf '%s' "$PROMPT" > "$PROMPT_FILE"
+fi
+if [[ ! -r "$PROMPT_FILE" ]]; then
+  echo "Missing prompt file: $PROMPT_FILE" >&2
+  exit 1
+fi
+
+PROMPT_BYTES=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+EST_PROMPT_TOKENS=$(( (PROMPT_BYTES + 1) / 2 + 16 ))
+SAFE_OUTPUT=$(( CTX_CAPACITY - SAFETY_MARGIN - EST_PROMPT_TOKENS ))
+if (( SAFE_OUTPUT < 1 )); then SAFE_OUTPUT=1; fi
+EFFECTIVE_TOKENS="$MAX_TOKENS"
+if (( EFFECTIVE_TOKENS > SAFE_OUTPUT )); then
+  echo "Q6A_GEMMA4_NPU_MAX_OUTPUT_CLAMP requested=${EFFECTIVE_TOKENS} effective=${SAFE_OUTPUT} ctx_capacity=${CTX_CAPACITY} prompt_bytes=${PROMPT_BYTES}" >&2
+  EFFECTIVE_TOKENS="$SAFE_OUTPUT"
+fi
+
+STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+STDOUT_LOG="$LOG_DIR/q6a_gemma4_${STAMP}.stdout.log"
+STDERR_LOG="$LOG_DIR/q6a_gemma4_${STAMP}.stderr.log"
+META_LOG="$LOG_DIR/q6a_gemma4_${STAMP}.meta"
+
+{
+  echo "timestamp=$(date -Is)"
+  echo "route=ctx1024_direct_q6a_package"
+  echo "model=$MODEL"
+  echo "runtime=$RUNTIME"
+  echo "prompt_file=$PROMPT_FILE"
+  echo "requested_max_tokens=$MAX_TOKENS"
+  echo "effective_max_tokens=$EFFECTIVE_TOKENS"
+  sha256sum "$MODEL" "$RUNTIME" 2>/dev/null || true
+} > "$META_LOG"
+
+export LD_LIBRARY_PATH="$WORK/runtime:${LD_LIBRARY_PATH:-}"
+export Q6A_GEMMA4_RUNTIME_LOG_PROFILE="${Q6A_GEMMA4_RUNTIME_LOG_PROFILE:-minimal}"
+
+echo "Q6A_GEMMA4_NPU_ROUTE_SELECTED=ctx1024_direct_q6a_package" >&2
+
+set +e
+if [[ "$DEBUG_STDERR" == "1" ]]; then
+  timeout "$TIMEOUT_SECS" "$RUNTIME" \
+    --backend=npu \
+    --model_path="$MODEL" \
+    --input_prompt_file="$PROMPT_FILE" \
+    --max_output_tokens="$EFFECTIVE_TOKENS" \
+    > >(tee "$STDOUT_LOG") \
+    2> >(tee "$STDERR_LOG" >&2)
+else
+  if [[ "$QUIET" == "1" ]]; then
+    timeout "$TIMEOUT_SECS" "$RUNTIME" \
+      --backend=npu \
+      --model_path="$MODEL" \
+      --input_prompt_file="$PROMPT_FILE" \
+      --max_output_tokens="$EFFECTIVE_TOKENS" \
+      > "$STDOUT_LOG" \
+      2> "$STDERR_LOG"
+    cat "$STDOUT_LOG"
+  else
+    timeout "$TIMEOUT_SECS" "$RUNTIME" \
+      --backend=npu \
+      --model_path="$MODEL" \
+      --input_prompt_file="$PROMPT_FILE" \
+      --max_output_tokens="$EFFECTIVE_TOKENS" \
+      > >(tee "$STDOUT_LOG") \
+      2> "$STDERR_LOG"
+  fi
+fi
+status=$?
+set -e
+
+echo "status=$status" >> "$META_LOG"
+echo "stdout=$STDOUT_LOG" >&2
+echo "stderr=$STDERR_LOG" >&2
+echo "meta=$META_LOG" >&2
+exit "$status"
